@@ -8,6 +8,7 @@ vi.mock("googleapis", () => {
   const insertEventFn = vi.fn();
   const updateEventFn = vi.fn();
   const deleteEventFn = vi.fn();
+  const getCalendarFn = vi.fn();
 
   return {
     google: {
@@ -20,9 +21,10 @@ vi.mock("googleapis", () => {
           delete: deleteEventFn,
         },
         calendarList: { list: listCalendarsFn },
+        calendars: { get: getCalendarFn },
       }),
     },
-    _mocks: { listEventsFn, getEventFn, listCalendarsFn, insertEventFn, updateEventFn, deleteEventFn },
+    _mocks: { getCalendarFn, listEventsFn, getEventFn, listCalendarsFn, insertEventFn, updateEventFn, deleteEventFn },
   };
 });
 
@@ -78,5 +80,29 @@ describe("calendar_list_events handler", () => {
     expect(_mocks.listEventsFn).toHaveBeenCalledWith(
       expect.objectContaining({ calendarId: "cal-work" }),
     );
+  });
+});
+
+describe("calendar_list_calendars for an identity with an empty list", () => {
+  const config: PermissionConfig = {
+    identity: "t",
+    permissions: { calendar: { access: "read", folders: ["cal-a", "cal-b"] } },
+  };
+  it("finds a shared calendar, and leaves out one it can't reach", async () => {
+    _mocks.listCalendarsFn.mockResolvedValueOnce({ data: { items: [] } });
+    _mocks.getCalendarFn.mockImplementation(async ({ calendarId }: { calendarId: string }) => {
+      if (calendarId === "cal-a") return { data: { id: "cal-a", summary: "A" } };
+      throw Object.assign(new Error("Not Found"), { code: 404 });
+    });
+    const tool = getCalendarTools(config, {} as any).find((t: any) => t.name === "calendar_list_calendars");
+    const res = await tool.handler({});
+    expect(res.calendars.map((c: any) => c.id)).toEqual(["cal-a"]);
+  });
+
+  it("doesn't report a Google failure as not shared", async () => {
+    _mocks.listCalendarsFn.mockResolvedValueOnce({ data: { items: [] } });
+    _mocks.getCalendarFn.mockRejectedValue(Object.assign(new Error("Backend Error"), { code: 500 }));
+    const tool = getCalendarTools(config, {} as any).find((t: any) => t.name === "calendar_list_calendars");
+    await expect(tool.handler({})).rejects.toThrow("Backend Error");
   });
 });

@@ -41,6 +41,13 @@ function getHeader(
 /**
  * Returns an array of ToolDef objects for Gmail, filtered by access level.
  */
+/** A line break in a header would add headers, such as a hidden Bcc. */
+function refuseHeaderInjection(...fields: string[]): void {
+  if (fields.some((f) => /[\r\n]/.test(f))) {
+    throw new Error("Recipients and subject can't contain line breaks");
+  }
+}
+
 export function getGmailTools(
   config: PermissionConfig,
   auth: AuthClient,
@@ -257,6 +264,7 @@ export function getGmailTools(
         const to = args.to as string;
         const subject = args.subject as string;
         const body = args.body as string;
+        refuseHeaderInjection(to, subject);
 
         const raw =
           `To: ${to}\r\n` +
@@ -307,6 +315,7 @@ export function getGmailTools(
         const to = args.to as string;
         const subject = args.subject as string;
         const body = args.body as string;
+        refuseHeaderInjection(to, subject);
 
         const raw =
           `To: ${to}\r\n` +

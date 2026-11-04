@@ -126,32 +126,22 @@ export function getSheetsTools(
           throw new Error(`Folder ${folderId} is not in allowed folders`);
         }
 
-        // Create the spreadsheet
-        const createRes = await sheets.spreadsheets.create({
-          requestBody: {
-            properties: { title },
-          },
-        });
-
-        const spreadsheetId = createRes.data.spreadsheetId!;
-
-        // Move to folder via Drive API — use specified folder or first allowed folder
-        const targetFolder = folderId ?? (allowedFolders.length > 0 ? allowedFolders[0] : null);
+        // With a folder, create it there through Drive. A service account has
+        // no storage of its own, so sheets.spreadsheets.create would be refused.
+        const targetFolder = folderId || (allowedFolders.length > 0 ? allowedFolders[0] : null);
+        let spreadsheetId: string;
         if (targetFolder) {
-          const fileMeta = await drive.files.get({
-            fileId: spreadsheetId,
-            fields: "parents",
+          const createRes = await drive.files.create({
+            requestBody: { name: title, mimeType: "application/vnd.google-apps.spreadsheet", parents: [targetFolder] },
+            fields: "id",
             supportsAllDrives: true,
           });
-          const previousParents = (fileMeta.data.parents ?? []).join(",");
-
-          await drive.files.update({
-            fileId: spreadsheetId,
-            addParents: targetFolder,
-            removeParents: previousParents || undefined,
-            fields: "id, parents",
-            supportsAllDrives: true,
+          spreadsheetId = createRes.data.id!;
+        } else {
+          const createRes = await sheets.spreadsheets.create({
+            requestBody: { properties: { title } },
           });
+          spreadsheetId = createRes.data.spreadsheetId!;
         }
 
         // Write headers if provided

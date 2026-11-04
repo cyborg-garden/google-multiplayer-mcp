@@ -109,6 +109,45 @@ export function createAuthClient(
   return client;
 }
 
+/**
+ * Create a client for a service account. It has no login to expire, and Google
+ * limits it to what was shared with it.
+ */
+export function createServiceAccountClient(
+  keyFile: string,
+  scopes: string[],
+): InstanceType<typeof google.auth.OAuth2> {
+  const key = JSON.parse(readFileSync(keyFile, "utf-8")) as {
+    client_email?: string;
+    private_key?: string;
+  };
+  if (!key.client_email || !key.private_key) {
+    throw new Error(`${keyFile} is not a service account key`);
+  }
+  return new google.auth.JWT({
+    email: key.client_email,
+    key: key.private_key,
+    scopes,
+  });
+}
+
+/** Whether a login belongs to this account. Throws if Google can't say. */
+export async function isAccount(
+  client: InstanceType<typeof google.auth.OAuth2>,
+  expected: string,
+): Promise<boolean> {
+  let actual: string | null | undefined;
+  try {
+    const about = await google.drive({ version: "v3", auth: client }).about.get({ fields: "user(emailAddress)" });
+    actual = about.data.user?.emailAddress;
+  } catch {
+    // Some logins have Gmail but not Drive.
+    const profile = await google.gmail({ version: "v1", auth: client }).users.getProfile({ userId: "me" });
+    actual = profile.data.emailAddress;
+  }
+  return (actual ?? "").toLowerCase() === expected.toLowerCase();
+}
+
 /** Run the OAuth browser flow for an identity. */
 export async function runAuthFlow(identity: string): Promise<void> {
   const config = loadGlobalConfig();
@@ -326,6 +365,7 @@ export function generateConsentUrl(identity: string): string {
 export async function exchangeCode(
   identity: string,
   code: string,
+  { expectedAccount }: { expectedAccount?: string } = {},
 ): Promise<{ email: string }> {
   const config = loadGlobalConfig();
   const client = new google.auth.OAuth2(
@@ -335,6 +375,18 @@ export async function exchangeCode(
   );
 
   const { tokens } = await client.getToken(code);
+
+  // Check before saving, so a code for the wrong account changes nothing.
+  if (expectedAccount) {
+    if (!tokens.refresh_token) {
+      throw new Error("Google returned no refresh token, so the existing login was kept.");
+    }
+    client.setCredentials(tokens);
+    if (!(await isAccount(client, expectedAccount))) {
+      throw new Error("That login is for a different account, so the existing login was kept.");
+    }
+  }
+
   saveTokens(identity, tokens as TokenSet);
 
   // The token is saved — auth has succeeded. The email lookup is best-effort:

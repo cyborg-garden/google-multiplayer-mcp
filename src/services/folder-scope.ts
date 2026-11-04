@@ -72,14 +72,16 @@ export async function isWithinAllowedFolders(
 interface TreeCacheEntry {
   expires: number;
   promise: Promise<Set<string>>;
+  generation: number;
 }
 
 const TREE_TTL_MS = 30_000;
-const treeCache = new Map<string, TreeCacheEntry>();
+const treeCache = new WeakMap<object, Map<string, TreeCacheEntry>>();
+let treeGeneration = 0;
 
 /** Clear the resolved-tree cache. Call after creating/moving folders. */
 export function invalidateFolderTreeCache(): void {
-  treeCache.clear();
+  treeGeneration++;
 }
 
 /**
@@ -90,7 +92,7 @@ export function invalidateFolderTreeCache(): void {
  * empty allowed list as "no restriction" rather than "nothing allowed".
  *
  * Follows pagination, caps depth, and guards cycles. Cached with a short TTL,
- * keyed by the sorted root list.
+ * per client and sorted root list.
  */
 export async function resolveAllowedFolderTree(
   drive: DriveClient,
@@ -100,17 +102,24 @@ export async function resolveAllowedFolderTree(
 
   const key = [...allowedFolders].sort().join(",");
   const now = Date.now();
-  const cached = treeCache.get(key);
-  if (cached && cached.expires > now) return cached.promise;
+  // Each client has its own cache: credentials can see different trees, and
+  // one credential's failure must not reach another.
+  let cache = treeCache.get(drive);
+  if (!cache) {
+    cache = new Map();
+    treeCache.set(drive, cache);
+  }
+  const cached = cache.get(key);
+  if (cached && cached.expires > now && cached.generation === treeGeneration) return cached.promise;
 
   const promise = bfsFolderTree(drive, allowedFolders);
-  treeCache.set(key, { expires: now + TREE_TTL_MS, promise });
+  cache.set(key, { expires: now + TREE_TTL_MS, promise, generation: treeGeneration });
 
   try {
     return await promise;
   } catch (err) {
     // Don't cache failures.
-    treeCache.delete(key);
+    cache.delete(key);
     throw err;
   }
 }

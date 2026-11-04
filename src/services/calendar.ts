@@ -166,6 +166,19 @@ export function getCalendarTools(
 
       if (allowedCalendars.length > 0) {
         calendars = calendars.filter((c) => allowedCalendars.includes(c.id ?? ""));
+        // A service account's list stays empty until something adds to it, so
+        // look up any allowed calendar it doesn't show.
+        const listed = new Set(calendars.map((c) => c.id));
+        for (const calendarId of allowedCalendars.filter((id) => !listed.has(id))) {
+          try {
+            const found = await cal.calendars.get({ calendarId });
+            calendars.push({ id: found.data.id, summary: found.data.summary, description: found.data.description });
+          } catch (err) {
+            // Only "not shared with this identity" means it isn't available.
+            const status = (err as { code?: unknown }).code;
+            if (status !== 404 && status !== 403 && status !== "404" && status !== "403") throw err;
+          }
+        }
       }
 
       return {

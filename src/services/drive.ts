@@ -11,6 +11,8 @@ import {
   invalidateFolderTreeCache,
 } from "./folder-scope.js";
 
+const MAX_DOWNLOAD_BYTES = 32 * 1024 * 1024;
+
 type AuthClient = InstanceType<typeof google.auth.OAuth2>;
 
 /**
@@ -192,7 +194,7 @@ export function getDriveTools(
       // Drive's `q` has a length limit and the allowed tree can contain many
       // folders; instead we post-filter results by tree membership. Search is
       // already bounded by pageSize.
-      const q = `fullText contains '${query.replace(/'/g, "\\'")}' and trashed = false`;
+      const q = `fullText contains '${query.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}' and trashed = false`;
 
       const scoped = allowedFolders.length > 0;
       const allowedTree = scoped
@@ -240,12 +242,17 @@ export function getDriveTools(
       // Check folder access via metadata
       const meta = await drive.files.get({
         fileId,
-        fields: "id, name, mimeType, parents",
+        fields: "id, name, mimeType, parents, size",
         supportsAllDrives: true,
       });
 
       if (!(await isWithinAllowedFolders(drive, fileId, allowedFolders))) {
         throw new Error("Item is outside allowed folders");
+      }
+
+      // The file is held in memory and returned as text.
+      if (Number(meta.data.size ?? 0) > MAX_DOWNLOAD_BYTES) {
+        throw new Error(`File is over the ${MAX_DOWNLOAD_BYTES / 1024 / 1024} MB download limit`);
       }
 
       const res = await drive.files.get(
@@ -308,7 +315,7 @@ export function getDriveTools(
         }
 
         const requestBody: Record<string, unknown> = { name, mimeType };
-        const targetFolder = folderId ?? (allowedFolders.length > 0 ? allowedFolders[0] : null);
+        const targetFolder = folderId || (allowedFolders.length > 0 ? allowedFolders[0] : null);
         if (targetFolder) requestBody.parents = [targetFolder];
 
         const res = await drive.files.create({
@@ -360,7 +367,7 @@ export function getDriveTools(
           name,
           mimeType: "application/vnd.google-apps.folder",
         };
-        const targetParent = parentId ?? (allowedFolders.length > 0 ? allowedFolders[0] : null);
+        const targetParent = parentId || (allowedFolders.length > 0 ? allowedFolders[0] : null);
         if (targetParent) requestBody.parents = [targetParent];
 
         const res = await drive.files.create({
