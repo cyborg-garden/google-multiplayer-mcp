@@ -264,7 +264,7 @@ function cleanString(text: string): string {
   return text
     .replace(/-----BEGIN[\s\S]*?(-----END[^-]*-----|$)/g, "<redacted>")
     .replace(/\bBearer\s+\S+/gi, "Bearer <redacted>")
-    .replace(/\bBasic\s+(?=[\w+/=-]*[0-9+/=A-Z])[\w+/=-]{8,}/gi, "Basic <redacted>")
+    .replace(/\b[Bb]asic\s+(?=[\w+/=-]*[0-9+/=A-Z])[\w+/=-]{8,}/g, "Basic <redacted>")
     .replace(/\b(ya29\.|GOCSPX-)[\w./-]+/g, "<redacted>")
     .replace(/\b(1\/\/|4\/[01])[\w./-]{10,}/g, "<redacted>")
     .replace(/\beyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]*/g, "<redacted>")
@@ -362,7 +362,8 @@ function reply(res: ServerResponse, status: number, body: unknown): void {
   const headers: Record<string, string> = { "Content-Type": "application/json", Connection: "close" };
   if (status === 429) headers["Retry-After"] = "1";
   res.writeHead(status, headers);
-  res.end(JSON.stringify(body), () => res.socket?.destroy());
+  const socket = res.socket;
+  res.end(JSON.stringify(body), () => socket?.destroy());
 }
 
 export interface BrokerOptions {
