@@ -348,6 +348,7 @@ export function generateConsentUrl(identity: string): string {
 export async function exchangeCode(
   identity: string,
   code: string,
+  { expectedAccount }: { expectedAccount?: string } = {},
 ): Promise<{ email: string }> {
   const config = loadGlobalConfig();
   const client = new google.auth.OAuth2(
@@ -357,6 +358,22 @@ export async function exchangeCode(
   );
 
   const { tokens } = await client.getToken(code);
+
+  // Check before saving, so a code for the wrong account changes nothing.
+  if (expectedAccount) {
+    if (!tokens.refresh_token) {
+      throw new Error("Google returned no refresh token, so the existing login was kept.");
+    }
+    client.setCredentials(tokens);
+    const about = await google
+      .drive({ version: "v3", auth: client })
+      .about.get({ fields: "user(emailAddress)" });
+    const actual = about.data.user?.emailAddress ?? "";
+    if (actual.toLowerCase() !== expectedAccount.toLowerCase()) {
+      throw new Error("That login is for a different account, so the existing login was kept.");
+    }
+  }
+
   saveTokens(identity, tokens as TokenSet);
 
   // The token is saved — auth has succeeded. The email lookup is best-effort:

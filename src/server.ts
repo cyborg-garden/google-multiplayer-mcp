@@ -106,7 +106,7 @@ export async function dispatchToolCall(
 
 export function getAuthTools(
   identity: string,
-  { reloadNeeded = true }: { reloadNeeded?: boolean } = {},
+  { reloadNeeded = true, expectedAccount }: { reloadNeeded?: boolean; expectedAccount?: string } = {},
 ): AuthToolDef[] {
   const afterLogin = reloadNeeded
     ? "Reload the MCP (HSM quick-restart) to activate the Google tools."
@@ -165,7 +165,7 @@ export function getAuthTools(
       handler: async (args) => {
         const code = typeof args.code === "string" ? args.code.trim() : "";
         try {
-          const { email } = await exchangeCode(identity, code);
+          const { email } = await exchangeCode(identity, code, { expectedAccount });
           return [
             {
               type: "text" as const,
@@ -178,15 +178,7 @@ export function getAuthTools(
           ];
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
-          return [
-            {
-              type: "text" as const,
-              text: JSON.stringify({
-                status: "error",
-                message: `Code exchange failed: ${message}`,
-              }),
-            },
-          ];
+          throw new Error(`Code exchange failed: ${message}`);
         }
       },
     },
