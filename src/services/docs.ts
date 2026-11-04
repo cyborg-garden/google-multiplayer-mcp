@@ -117,30 +117,22 @@ export function getDocsTools(
           throw new Error(`Folder ${folderId} is not in allowed folders`);
         }
 
-        // Create the document
-        const createRes = await docs.documents.create({
-          requestBody: { title },
-        });
-
-        const documentId = createRes.data.documentId!;
-
-        // Move to folder via Drive API — use specified folder or first allowed folder
+        // With a folder, create it there through Drive. A service account has
+        // no storage of its own, so docs.documents.create would be refused.
         const targetFolder = folderId ?? (allowedFolders.length > 0 ? allowedFolders[0] : null);
+        let documentId: string;
         if (targetFolder) {
-          const fileMeta = await drive.files.get({
-            fileId: documentId,
-            fields: "parents",
+          const createRes = await drive.files.create({
+            requestBody: { name: title, mimeType: "application/vnd.google-apps.document", parents: [targetFolder] },
+            fields: "id",
             supportsAllDrives: true,
           });
-          const previousParents = (fileMeta.data.parents ?? []).join(",");
-
-          await drive.files.update({
-            fileId: documentId,
-            addParents: targetFolder,
-            removeParents: previousParents || undefined,
-            fields: "id, parents",
-            supportsAllDrives: true,
+          documentId = createRes.data.id!;
+        } else {
+          const createRes = await docs.documents.create({
+            requestBody: { title },
           });
+          documentId = createRes.data.documentId!;
         }
 
         // Insert content if provided
