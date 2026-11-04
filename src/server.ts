@@ -8,7 +8,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type { PermissionConfig, ToolDef } from "./types.js";
-import { formatToolError } from "./auth-errors.js";
+import { formatToolError, type ToolErrorPayload } from "./auth-errors.js";
 import {
   createAuthClient,
   startHeadlessAuth,
@@ -23,8 +23,10 @@ import { getDocsTools } from "./services/docs.js";
 import { getSheetsTools } from "./services/sheets.js";
 
 /** Collect all tools the agent is allowed to use based on permissions. */
-export function collectTools(config: PermissionConfig): ToolDef[] {
-  const auth = createAuthClient(config.identity);
+export function collectTools(
+  config: PermissionConfig,
+  auth: ReturnType<typeof createAuthClient> = createAuthClient(config.identity),
+): ToolDef[] {
   return [
     ...getDriveTools(config, auth),
     ...getCalendarTools(config, auth),
@@ -58,6 +60,7 @@ export async function dispatchToolCall(
   args: Record<string, unknown> | undefined,
   tools: ToolDef[],
   authTools: AuthToolDef[],
+  formatError: (err: unknown) => ToolErrorPayload = formatToolError,
 ): Promise<CallToolResult> {
   // Auth tools first — these manage the auth flow itself and own their error
   // shape, so they are not run through the auth-expired wrapper.
@@ -91,7 +94,7 @@ export async function dispatchToolCall(
       ],
     };
   } catch (err: unknown) {
-    const payload = formatToolError(err);
+    const payload = formatError(err);
     return {
       content: [
         { type: "text" as const, text: JSON.stringify(payload, null, 2) },
@@ -101,7 +104,13 @@ export async function dispatchToolCall(
   }
 }
 
-export function getAuthTools(identity: string): AuthToolDef[] {
+export function getAuthTools(
+  identity: string,
+  { reloadNeeded = true }: { reloadNeeded?: boolean } = {},
+): AuthToolDef[] {
+  const afterLogin = reloadNeeded
+    ? "Reload the MCP (HSM quick-restart) to activate the Google tools."
+    : "The Google tools are ready.";
   return [
     {
       name: "google_auth_url",
@@ -163,9 +172,7 @@ export function getAuthTools(identity: string): AuthToolDef[] {
               text: JSON.stringify({
                 status: "authenticated",
                 email,
-                message:
-                  `Authenticated as ${email}. Reload the MCP (HSM quick-restart) ` +
-                  "to activate the Google tools.",
+                message: `Authenticated as ${email}. ${afterLogin}`,
               }),
             },
           ];

@@ -109,6 +109,28 @@ export function createAuthClient(
   return client;
 }
 
+/**
+ * Create a client for a service account. It has no login to expire, and Google
+ * limits it to what was shared with it.
+ */
+export function createServiceAccountClient(
+  keyFile: string,
+  scopes: string[],
+): InstanceType<typeof google.auth.OAuth2> {
+  const key = JSON.parse(readFileSync(keyFile, "utf-8")) as {
+    client_email?: string;
+    private_key?: string;
+  };
+  if (!key.client_email || !key.private_key) {
+    throw new Error(`${keyFile} is not a service account key`);
+  }
+  return new google.auth.JWT({
+    email: key.client_email,
+    key: key.private_key,
+    scopes,
+  });
+}
+
 /** Run the OAuth browser flow for an identity. */
 export async function runAuthFlow(identity: string): Promise<void> {
   const config = loadGlobalConfig();

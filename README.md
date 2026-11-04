@@ -80,3 +80,50 @@ The companion agent skill `skills/reauth-google/SKILL.md` packages this as a
 "reauth google" procedure for Signal/DM, including proactive use on
 `invalid_grant`. The MCP starts in **auth-tools-only** mode when tokens are
 missing/invalid (it does not exit), so these auth tools are always reachable.
+
+## Broker mode
+
+Broker mode runs one HTTP service that holds the Google credentials for many agents. An agent holds only a secret that identifies it to the broker, so it has no Google credential to read.
+
+```bash
+google-multiplayer-mcp broker --config broker.yaml
+```
+
+```yaml
+# broker.yaml. Relative paths are read from this file's directory.
+host: 127.0.0.1
+port: 8797
+audit_log: audit.jsonl
+agents:
+  research:
+    secret_sha256: <sha256 of the agent's secret, as hex>
+    credential: {type: service_account, key_file: keys/research.json}
+    permissions:
+      drive: {access: write, folders: [<folder-id>]}
+      docs: {access: write, folders: [<folder-id>]}
+      sheets: {access: write, folders: [<folder-id>]}
+      calendar: {access: write, folders: [<calendar-id>]}
+  assistant:
+    secret_sha256: <sha256 of the agent's secret, as hex>
+    credential: {type: oauth, identity: assistant}
+    allow_whole_account: true
+    permissions:
+      gmail: {access: read}
+```
+
+Connect an agent over MCP's streamable HTTP transport, at `/mcp` with the header `Authorization: Bearer <secret>`.
+
+**Service accounts** suit team folders. Share each folder or calendar with the service account, so Google itself refuses anything else. Sharing a Shared Drive folder as Content manager lets the agent move and delete files as well as edit them. They have no consent screen and no login to expire. They can't use Gmail, and they must list their folders.
+
+**OAuth** suits a real person's account. Tokens and the client come from the same `GOOGLE_TOKEN_DIR` and `GOOGLE_CLIENT_ID` settings as stdio mode. An agent can re-authenticate with `google_auth_url` and `google_auth_exchange`, and needs no reload afterwards.
+
+**Rules the broker applies at startup:**
+
+- A key file must not be readable by group or others.
+- Each agent needs its own secret.
+- A service with no `access` means no access.
+- An OAuth agent with no folders listed must set `allow_whole_account: true`.
+
+**Audit log:** one JSON line per tool call, with the agent, tool, result, time taken and IDs such as `fileId`. It never records content, names or secrets. Refused requests are logged as `denied`.
+
+Keep the broker's files out of reach of agents, and bind it to loopback unless something else protects the port. Calls are stateless, so restarting the broker doesn't disturb connected agents.
