@@ -1,3 +1,4 @@
+import http from "node:http";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createHash, generateKeyPairSync } from "crypto";
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
@@ -402,6 +403,29 @@ describe("broker requests", () => {
     expect(denied.status).toBe(401);
   });
 
+  it("lets a keep-alive client carry on after a refusal", async () => {
+    const { url } = await start({ alpha: { tools: [], authTools: [] } });
+    const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
+    const post = () =>
+      new Promise<number>((resolve, reject) => {
+        const req = http.request(
+          `${url}/mcp`,
+          { method: "POST", agent, headers: { Authorization: "Bearer wrong" } },
+          (res) => {
+            res.resume();
+            res.on("end", () => resolve(res.statusCode ?? 0));
+          },
+        );
+        req.on("error", reject);
+        req.end("{}");
+      });
+    try {
+      for (let i = 0; i < 60; i++) expect(await post()).toBe(401);
+    } finally {
+      agent.destroy();
+    }
+  });
+
   it("keeps working if the full audit log was deleted", async () => {
     const { url } = await start({ alpha: { tools: [fakeTool("t")], authTools: [] } }, { maxAuditBytes: 300 });
     const a = await connect(url, "alpha-secret");
@@ -665,6 +689,13 @@ describe("cleanErrorText", () => {
     const started = Date.now();
     cleanErrorText(unit.repeat(times));
     expect(Date.now() - started).toBeLessThan(500);
+  });
+  it("doesn't leak a secret cut off by the length cap", () => {
+    const filler = `-----BEGIN KEY-----${"x".repeat(15_000)}-----END KEY-----`;
+    for (let pad = 0; pad < 80; pad++) {
+      const out = cleanErrorText(`${filler}${"y".repeat(pad)} "client_secret":"s3cretXYZ${"z".repeat(2000)}"`);
+      expect(out).not.toContain("s3cret");
+    }
   });
   it("keeps Drive IDs, and caps length", () => {
     expect(cleanErrorText("File not found: 1UyHc-d_w.")).toContain("1UyHc-d_w");

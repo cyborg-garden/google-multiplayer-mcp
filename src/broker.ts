@@ -262,9 +262,11 @@ const SECRET_KEY = /^(client_?secret|refresh_?token|access_?token|id_?token|priv
 
 /** Agents can put long text in an error, so never run the patterns on all of it. */
 const MAX_CLEANED_INPUT = 16_000;
+const CUT_MARGIN = 1024;
 
 function cleanString(text: string): string {
-  return text
+  const cut = text.length > MAX_CLEANED_INPUT;
+  const cleaned = text
     .slice(0, MAX_CLEANED_INPUT)
     .replace(/-----BEGIN[\s\S]*?(-----END[^-]*-----|$)/g, "<redacted>")
     .replace(/\bBearer\s+\S+/gi, "Bearer <redacted>")
@@ -277,8 +279,9 @@ function cleanString(text: string): string {
       "$1: <redacted>",
     )
     .replace(/(^|[\s"'(=:])\/(?:[\w.-]+\/)+[\w.-]*/g, "$1<path>")
-    .replace(/\b[A-Za-z]:\\[^\s"')]+/g, "<path>")
-    .slice(0, 2000);
+    .replace(/\b[A-Za-z]:\\[^\s"')]+/g, "<path>");
+  // The cap can split a secret so no pattern matches it. Never show that end.
+  return (cut ? cleaned.slice(0, -CUT_MARGIN) : cleaned).slice(0, 2000);
 }
 
 function cleanValue(value: unknown): unknown {
@@ -365,24 +368,24 @@ function readBody(req: IncomingMessage, limit: number): Promise<Buffer> {
 const REPLY_LINGER_MS = 1000;
 
 function reply(res: ServerResponse, status: number, body: unknown): void {
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (status === 429) headers["Retry-After"] = "1";
-  res.writeHead(status, headers);
-  const socket = res.socket;
+  const send = (): void => {
+    clearTimeout(timer);
+    if (res.headersSent || res.destroyed) return;
+    // Say we're closing, so a keep-alive client doesn't reuse this connection.
+    const headers: Record<string, string> = { "Content-Type": "application/json", Connection: "close" };
+    if (status === 429) headers["Retry-After"] = "1";
+    res.writeHead(status, headers);
+    res.end(JSON.stringify(body));
+  };
   const req = res.req;
-  res.end(JSON.stringify(body), () => {
-    if (!socket || socket.destroyed) return;
-    if (req.complete) {
-      socket.destroySoon();
-      return;
-    }
-    // Closing on unread data resets the connection and loses this reply. So
-    // discard the rest of the body, but only for a short time.
-    const timer = setTimeout(() => socket.destroy(), REPLY_LINGER_MS);
-    socket.once("close", () => clearTimeout(timer));
-    req.once("end", () => socket.destroySoon());
-    req.resume();
-  });
+  let timer: NodeJS.Timeout | undefined;
+  if (req.complete) return send();
+  // Closing on unread data resets the connection and loses the reply. So
+  // discard the rest of the body first, but only for a short time.
+  timer = setTimeout(send, REPLY_LINGER_MS);
+  res.once("close", () => clearTimeout(timer));
+  req.once("end", send);
+  req.resume();
 }
 
 export interface BrokerOptions {
