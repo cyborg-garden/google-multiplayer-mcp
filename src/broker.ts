@@ -262,10 +262,8 @@ const SECRET_KEY = /^(client_?secret|refresh_?token|access_?token|id_?token|priv
 
 /** Agents can put long text in an error, so never run the patterns on all of it. */
 const MAX_CLEANED_INPUT = 16_000;
-const CUT_MARGIN = 1024;
 
 function cleanString(text: string): string {
-  const cut = text.length > MAX_CLEANED_INPUT;
   const cleaned = text
     .slice(0, MAX_CLEANED_INPUT)
     .replace(/-----BEGIN[\s\S]*?(-----END[^-]*-----|$)/g, "<redacted>")
@@ -275,13 +273,13 @@ function cleanString(text: string): string {
     .replace(/\b(1\/\/|4\/[01])[\w./-]{10,}/g, "<redacted>")
     .replace(/\beyJ[\w-]{8,}(?:\.[\w-]*)*/g, "<redacted>")
     .replace(
-      /"?\b(client_?secret|refresh_?token|access_?token|id_?token|private_?key|assertion|code)\b"?\s*(=\s*[^\s",&}]+|:\s*"[^"]*"|:\s*'[^']*'|:\s*[^\s",}]{16,})/gi,
+      /"?\b(client_?secret|refresh_?token|access_?token|id_?token|private_?key|assertion|code)\b\\?["']?\s*(=\s*[^\s",&}]+|:\s*\\?"[^"]*"?|:\s*'[^']*'?|:\s*[^\s",}]{16,})/gi,
       "$1: <redacted>",
     )
     .replace(/(^|[\s"'(=:])\/(?:[\w.-]+\/)+[\w.-]*/g, "$1<path>")
     .replace(/\b[A-Za-z]:\\[^\s"')]+/g, "<path>");
-  // The cap can split a secret so no pattern matches it. Never show that end.
-  return (cut ? cleaned.slice(0, -CUT_MARGIN) : cleaned).slice(0, 2000);
+  // Closing quotes are optional above, as the cap can cut a value in half.
+  return cleaned.slice(0, 2000);
 }
 
 function cleanValue(value: unknown): unknown {

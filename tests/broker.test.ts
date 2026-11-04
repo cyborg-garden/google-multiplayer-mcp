@@ -675,6 +675,9 @@ describe("cleanErrorText", () => {
     ['"refresh_token": "1//r3fresh"', "r3fresh"],
     ["Create /Users/someone/.config/config.json first", "/Users/someone"],
     ["BASIC dXNlcjpwYXNz", "dXNlcjpwYXNz"],
+    ['"client_secret":"s3cret', "s3cret"],
+    ['\\"client_secret\\":\\"s3cret\\"', "s3cret"],
+    ["'refresh_token': 'r3fresh", "r3fresh"],
     ["cut off jwt eyJhbGciOiJSUzI1.eyJpc3MiOiJh", "eyJhbGci"],
   ])("removes the secret from %s", (input, secret) => {
     expect(cleanErrorText(input)).not.toContain(secret);
@@ -697,6 +700,19 @@ describe("cleanErrorText", () => {
       expect(out).not.toContain("s3cret");
     }
   });
+  it("keeps the start of a long error that is mostly a key", () => {
+    const out = cleanErrorText(`Could not read file -----BEGIN KEY-----${"x".repeat(20_000)}`);
+    expect(out).toContain("Could not read file");
+    expect(out).not.toContain("xxx");
+  });
+  it.each(['code:"', "code:'", '\\"code\\":\\"', "code: ", "code=", '"code"'])(
+    "stays fast at the cap on repeated %s",
+    (unit) => {
+      const started = process.hrtime.bigint();
+      cleanErrorText(unit.repeat(Math.ceil(16_000 / unit.length)));
+      expect(Number(process.hrtime.bigint() - started) / 1e6).toBeLessThan(20);
+    },
+  );
   it("keeps Drive IDs, and caps length", () => {
     expect(cleanErrorText("File not found: 1UyHc-d_w.")).toContain("1UyHc-d_w");
     expect(cleanErrorText("x".repeat(5000))).toHaveLength(2000);
