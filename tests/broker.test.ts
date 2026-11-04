@@ -344,9 +344,56 @@ describe("broker requests", () => {
     const raw = readFileSync(join(dir, "audit.jsonl"), "utf-8");
     expect(raw).not.toContain("private");
     expect(auditLines()[0].args).toEqual({
-      to: { count: 2, first: ["boss@x.example", "hidden@y.example"] },
-      attendees: { count: 1, first: ["c@z.example"] },
+      to: expect.objectContaining({ count: 2, first: ["boss@x.example", "hidden@y.example"] }),
+      attendees: expect.objectContaining({ count: 1, first: ["c@z.example"] }),
     });
+  });
+
+  it("doesn't stall on a huge recipient field", async () => {
+    const { url } = await start({ alpha: { tools: [fakeTool("t")], authTools: [] } }, { maxBodyBytes: 8 * 1024 * 1024 });
+    const a = await connect(url, "alpha-secret");
+    const started = Date.now();
+    await a.callTool({ name: "t", arguments: { to: "a".repeat(6 * 1024 * 1024) } });
+    await a.close();
+    expect(Date.now() - started).toBeLessThan(1500);
+    expect(auditLines()[0].args.to.chars).toBeLessThanOrEqual(16_384);
+  });
+
+  it("closes the connection after a plain reply, so an unread body can't hold it", async () => {
+    const { url } = await start({ alpha: { tools: [], authTools: [] } });
+    const { port } = new URL(url);
+    for (const path of ["/healthz", "/mcp", "/other"]) {
+      const closed = await new Promise<boolean>((done) => {
+        const socket = connectSocket(Number(port), "127.0.0.1", () => {
+          socket.write(`POST ${path} HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n`);
+        });
+        socket.on("close", () => done(true));
+        socket.on("error", () => {});
+        setTimeout(() => done(false), 1500);
+      });
+      expect(closed).toBe(true);
+    }
+  });
+
+  it("tells a busy client when to retry", async () => {
+    const { url } = await start({ alpha: { tools: [], authTools: [] } }, { maxRequestsPerSecond: 0 });
+    const res = await fetch(`${url}/mcp`, { method: "POST", headers: { Authorization: "Bearer alpha-secret" }, body: "{}" });
+    await fetch(`${url}/mcp`, { method: "POST", headers: { Authorization: "Bearer alpha-secret" }, body: "{}" });
+    const busy = await fetch(`${url}/mcp`, { method: "POST", headers: { Authorization: "Bearer alpha-secret" }, body: "{}" });
+    expect(res.status).toBeDefined();
+    expect(busy.status).toBe(429);
+    expect(busy.headers.get("retry-after")).toBe("1");
+  });
+
+  it("keeps working if the full audit log was deleted", async () => {
+    const { url } = await start({ alpha: { tools: [fakeTool("t")], authTools: [] } }, { maxAuditBytes: 300 });
+    const a = await connect(url, "alpha-secret");
+    await a.callTool({ name: "t", arguments: {} });
+    rmSync(join(dir, "audit.jsonl"));
+    for (let i = 0; i < 4; i++) {
+      expect((await a.callTool({ name: "t", arguments: {} })).isError).toBeFalsy();
+    }
+    await a.close();
   });
 
   it("doesn't flood the log with unknown tools", async () => {
@@ -580,6 +627,9 @@ describe("cleanErrorText", () => {
     ["-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----", "abc"],
     ["token ya29.abc-def", "ya29"],
     ["GOCSPX-abc123", "GOCSPX"],
+    ["code 4/0BabcdefghijklMN", "4/0Babc"],
+    ["Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"],
+    ["jwt eyJhbGciOiJSUzI1.eyJpc3MiOiJh.c2ln", "eyJhbGci"],
     ['{"client_secret":"s3cret"}', "s3cret"],
     ['"refresh_token": "1//r3fresh"', "r3fresh"],
     ["Create /Users/juni/.nimbleco-google/config.json first", "/Users/juni"],
@@ -604,6 +654,7 @@ describe("cleanErrorText", () => {
   it("leaves ordinary text that looks a bit like a secret", () => {
     expect(cleanErrorText("Basic plan required")).toBe("Basic plan required");
     expect(cleanErrorText("due 4/04/2026")).toBe("due 4/04/2026");
+    expect(cleanErrorText("Basic authentication failed")).toBe("Basic authentication failed");
   });
   it("leaves ordinary errors and URLs alone", () => {
     expect(cleanErrorText("access_token: must be set")).toBe("access_token: must be set");

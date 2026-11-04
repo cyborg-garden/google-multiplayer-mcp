@@ -97,7 +97,10 @@ export function checkToolArgs(
         continue;
       }
       if (!(value as string).trim()) return bad(`${name} can't be empty`);
-      if (/^\.+$/.test(value as string)) return bad(`${name} isn't a valid ID`);
+    }
+    // `range` also goes into the URL path.
+    if (wanted === "string" && (isId || name === "range") && /^\s*\.+\s*$/.test(value as string)) {
+      return bad(`${name} isn't valid`);
     }
 
     if (wanted === "array" && spec.items?.type) {

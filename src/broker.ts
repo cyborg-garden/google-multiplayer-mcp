@@ -35,13 +35,15 @@ const TOOL_DEADLINE_MS = 240_000;
 const REQUEST_DEADLINE_MS = 270_000;
 /** High on purpose: agents share an address, so idle sockets can't be told apart. */
 const MAX_CONNECTIONS = 2048;
-const MAX_REQUESTS_PER_SECOND = 20;
+const MAX_REQUESTS_PER_SECOND = 50;
+/** Cap what's searched for addresses, because this runs on the event loop. */
+const MAX_RECIPIENT_TEXT = 16_384;
 const MAX_AUDIT_BYTES = 64 * 1024 * 1024;
 const LOOPBACK = new Set(["127.0.0.1", "::1", "localhost"]);
 /** Fields naming people, audited as a list however they were written. */
 const AUDITED_RECIPIENTS = new Set(["to", "cc", "bcc", "attendees"]);
 /** Audited values must look like an ID, so an agent can't stuff the log. */
-const AUDITABLE_VALUE = /^[\w@.+-]{1,256}$/;
+const AUDITABLE_VALUE = /^[\w@.+-]{1,128}$/;
 const SAFE_IDENTITY = /^[A-Za-z0-9_-]{1,64}$/;
 const ACCESS_LEVELS = ["none", "read", "write", "admin"];
 /** The only OAuth auth tools that work without a callback server in the agent. */
@@ -262,9 +264,10 @@ function cleanString(text: string): string {
   return text
     .replace(/-----BEGIN[\s\S]*?(-----END[^-]*-----|$)/g, "<redacted>")
     .replace(/\bBearer\s+\S+/gi, "Bearer <redacted>")
-    .replace(/\bBasic\s+[A-Za-z0-9+/=]{12,}/gi, "Basic <redacted>")
+    .replace(/\bBasic\s+(?=[\w+/=-]*[0-9+/=A-Z])[\w+/=-]{8,}/gi, "Basic <redacted>")
     .replace(/\b(ya29\.|GOCSPX-)[\w./-]+/g, "<redacted>")
-    .replace(/\b(1\/\/|4\/0A)[\w./-]{10,}/g, "<redacted>")
+    .replace(/\b(1\/\/|4\/[01])[\w./-]{10,}/g, "<redacted>")
+    .replace(/\beyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]*/g, "<redacted>")
     .replace(
       /"?\b(client_?secret|refresh_?token|access_?token|id_?token|private_?key|assertion|code)\b"?\s*(=\s*[^\s",&}]+|:\s*"[^"]*"|:\s*'[^']*'|:\s*[^\s",}]{16,})/gi,
       "$1: <redacted>",
@@ -319,9 +322,10 @@ function auditArgs(args: Record<string, unknown> | undefined): Record<string, un
     if (AUDITED_ARGS.has(k) && typeof v === "string" && AUDITABLE_VALUE.test(v)) out[k] = v;
     if (AUDITED_RECIPIENTS.has(k) && (typeof v === "string" || Array.isArray(v))) {
       // Addresses only, so a recipient field can't carry content into the log.
-      const text = (Array.isArray(v) ? v.filter((i) => typeof i === "string") : [v]).join(" ");
-      const people = text.match(/[\w.+-]{1,64}@[\w.-]{1,190}/g) ?? [];
-      out[k] = { count: people.length, first: people.slice(0, 5) };
+      const items = Array.isArray(v) ? v.slice(0, 256).filter((i) => typeof i === "string") : [v];
+      const text = items.map((i) => (i as string).slice(0, 1024)).join(" ").slice(0, MAX_RECIPIENT_TEXT);
+      const people = text.match(/[\p{L}\p{N}.+_-]{1,64}@[\p{L}\p{N}.-]{1,190}/gu) ?? [];
+      out[k] = { count: people.length, chars: text.length, first: people.slice(0, 5) };
     }
   }
   return out;
@@ -354,8 +358,11 @@ function readBody(req: IncomingMessage, limit: number): Promise<Buffer> {
 }
 
 function reply(res: ServerResponse, status: number, body: unknown): void {
-  res.writeHead(status, { "Content-Type": "application/json" });
-  res.end(JSON.stringify(body));
+  // Close afterwards, or an unread body can hold the connection open.
+  const headers: Record<string, string> = { "Content-Type": "application/json", Connection: "close" };
+  if (status === 429) headers["Retry-After"] = "1";
+  res.writeHead(status, headers);
+  res.end(JSON.stringify(body), () => res.socket?.destroy());
 }
 
 export interface BrokerOptions {
@@ -398,12 +405,18 @@ export function createBroker(config: BrokerConfig, options: BrokerOptions = {}):
     try {
       const line = JSON.stringify({ ts: new Date().toISOString(), ...event }) + "\n";
       // Keep one old file, so the log can't fill the disk.
-      if (auditBytes + line.length > maxAuditBytes) {
-        renameSync(config.auditLog, `${config.auditLog}.1`);
+      const size = Buffer.byteLength(line);
+      if (auditBytes + size > maxAuditBytes) {
+        try {
+          renameSync(config.auditLog, `${config.auditLog}.1`);
+        } catch (err) {
+          // If the log was deleted, there's nothing to move aside.
+          if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+        }
         auditBytes = 0;
       }
       appendFileSync(config.auditLog, line, { mode: 0o600 });
-      auditBytes += line.length;
+      auditBytes += size;
       return true;
     } catch (err) {
       console.error(`broker: audit write failed: ${err instanceof Error ? err.message : String(err)}`);
