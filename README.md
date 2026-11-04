@@ -127,9 +127,9 @@ Connect an agent over MCP's streamable HTTP transport, at `/mcp` with the header
 - Listening beyond loopback needs `allow_non_loopback: true`.
 - The audit log must be writable.
 
-**Limits:** 8 requests at once per agent and 32 in total, counted until the work ends even if the client disconnects. Also one JSON-RPC message per request, a 32 MB request body by default, a 32 MB Drive download, 128 connections, a two-minute timeout per Google request with no retries, and four minutes per tool call. An agent should retry a call that Google refuses for being busy.
+**Limits:** 8 requests at once per agent and 32 in total, counted until the work ends even if the client disconnects, up to the four-minute limit per tool call. Also 20 requests a second per agent, one JSON-RPC message per request, a 32 MB request body by default, a 32 MB Drive download, 2,048 connections, and a two-minute timeout per Google request with no retries. An agent should retry a call that Google refuses for being busy.
 
-**Audit log:** one JSON line when a call starts, and one when it ends, with the agent, tool, result, time taken and IDs such as `fileId`. It never records content, names or secrets. If the log can't be written, the call isn't run. Refused requests are logged as `denied` or `refused`.
+**Audit log:** one JSON line when a call starts, and one when it ends, with the agent, tool, result, time taken and IDs such as `fileId`. Recipients are recorded as email addresses only. It never records content, names or secrets. At 64 MB it moves to `audit.jsonl.1`, replacing any older one. If the log can't be written, the call isn't run. Refused requests are logged as `denied` or `refused`.
 
 **Keep it safe:**
 

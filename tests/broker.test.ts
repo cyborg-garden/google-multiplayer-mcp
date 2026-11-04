@@ -300,8 +300,8 @@ describe("broker requests", () => {
 
   it("limits connections", async () => {
     await start({ alpha: { tools: [], authTools: [] } });
-    expect(server!.maxConnections).toBeGreaterThan(0);
-    expect(server!.headersTimeout).toBeLessThanOrEqual(10_000);
+    expect(server!.maxConnections).toBeGreaterThanOrEqual(1024);
+    expect(server!.headersTimeout).toBeLessThanOrEqual(3_000);
   });
 
   it("refuses a saved login for the wrong account, and rechecks it", async () => {
@@ -329,15 +329,136 @@ describe("broker requests", () => {
     await a.close();
   });
 
-  it("audits every recipient, however it was written", async () => {
+  it("audits recipients as addresses only", async () => {
     const { url } = await start({ alpha: { tools: [fakeTool("t")], authTools: [] } });
     const a = await connect(url, "alpha-secret");
-    await a.callTool({ name: "t", arguments: { to: "boss@x.example, hidden@y.example", attendees: ["c@z.example"] } });
+    await a.callTool({
+      name: "t",
+      arguments: {
+        to: "Boss <boss@x.example>, hidden@y.example private words",
+        attendees: ["c@z.example", 5],
+        cc: { toString: 1 },
+      },
+    });
     await a.close();
+    const raw = readFileSync(join(dir, "audit.jsonl"), "utf-8");
+    expect(raw).not.toContain("private");
     expect(auditLines()[0].args).toEqual({
       to: { count: 2, first: ["boss@x.example", "hidden@y.example"] },
       attendees: { count: 1, first: ["c@z.example"] },
     });
+  });
+
+  it("doesn't flood the log with unknown tools", async () => {
+    const { url } = await start({ alpha: { tools: [fakeTool("t")], authTools: [] } });
+    const a = await connect(url, "alpha-secret");
+    for (let i = 0; i < 5; i++) {
+      await a.callTool({ name: "nope", arguments: { to: "a@b.example" } });
+    }
+    await a.close();
+    const lines = auditLines();
+    expect(lines.filter((l) => l.event === "unknown_tool")).toHaveLength(1);
+    expect(lines.filter((l) => l.event === "call")).toHaveLength(0);
+  });
+
+  it("limits how fast an agent can go", async () => {
+    const { url } = await start({ alpha: { tools: [fakeTool("t")], authTools: [] } }, { maxRequestsPerSecond: 3 });
+    const headers = { Authorization: "Bearer alpha-secret", "Content-Type": "application/json", Accept: "application/json, text/event-stream" };
+    const statuses: number[] = [];
+    for (let i = 0; i < 20; i++) {
+      const res = await fetch(`${url}/mcp`, { method: "POST", headers, body: JSON.stringify({ jsonrpc: "2.0", id: i, method: "tools/list" }) });
+      statuses.push(res.status);
+    }
+    expect(statuses).toContain(429);
+    await new Promise((done) => setTimeout(done, 1100));
+    const later = await fetch(`${url}/mcp`, { method: "POST", headers, body: JSON.stringify({ jsonrpc: "2.0", id: 99, method: "tools/list" }) });
+    expect(later.status).toBe(200);
+  });
+
+  it("moves a full audit log aside, keeping one old file", async () => {
+    const { url } = await start({ alpha: { tools: [fakeTool("t")], authTools: [] } }, { maxAuditBytes: 400 });
+    const a = await connect(url, "alpha-secret");
+    for (let i = 0; i < 10; i++) await a.callTool({ name: "t", arguments: {} });
+    await a.close();
+    expect(readFileSync(join(dir, "audit.jsonl"), "utf-8").length).toBeLessThanOrEqual(400);
+    expect(readFileSync(join(dir, "audit.jsonl.1"), "utf-8").length).toBeGreaterThan(0);
+  });
+
+  it("keeps limits exact when a client leaves during the login check", async () => {
+    let releaseCheck = () => {};
+    let checks = 0;
+    let ran = 0;
+    let releaseSlow = () => {};
+    const gate = new Promise<void>((done) => { releaseSlow = done; });
+    const config: BrokerConfig = {
+      host: "127.0.0.1", port: 0, auditLog: join(dir, "audit.jsonl"), maxBodyBytes: 4096, maxInFlightPerAgent: 1,
+      agents: [agent("alpha", "alpha-secret")],
+    };
+    server = createBroker(config, {
+      build: () => ({ tools: [fakeTool("t", async () => { ran++; await gate; return {}; })], authTools: [] }),
+      verifyLogin: async () => {
+        checks++;
+        if (checks === 1) await new Promise<void>((done) => { releaseCheck = done; });
+        return true;
+      },
+    });
+    await new Promise<void>((done) => server!.listen(0, "127.0.0.1", done));
+    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const headers = { Authorization: "Bearer alpha-secret", "Content-Type": "application/json", Accept: "application/json, text/event-stream" };
+    const call = (id: number) => JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name: "t", arguments: {} } });
+    const wait = () => new Promise((done) => setTimeout(done, 50));
+
+    const dropped = new AbortController();
+    const first = fetch(`${url}/mcp`, { method: "POST", headers, body: call(1), signal: dropped.signal }).catch(() => null);
+    await wait();
+    dropped.abort();
+    await first;
+    await wait();
+    releaseCheck();
+    await wait();
+    expect(ran).toBe(0);
+
+    // A double release would leave the count below zero, and let a second call in.
+    const held = fetch(`${url}/mcp`, { method: "POST", headers, body: call(2) });
+    await wait();
+    expect(ran).toBe(1);
+    expect((await fetch(`${url}/mcp`, { method: "POST", headers, body: call(3) })).status).toBe(429);
+    releaseSlow();
+    await held;
+  });
+
+  it("only rechecks a login after a real new one", async () => {
+    let builds = 0;
+    let exchangeWorks = false;
+    const config: BrokerConfig = {
+      host: "127.0.0.1", port: 0, auditLog: join(dir, "a.jsonl"), maxBodyBytes: 1024,
+      agents: [agent("alpha", "alpha-secret")],
+    };
+    server = createBroker(config, {
+      verifyLogin: async () => true,
+      build: () => {
+        builds++;
+        return {
+          tools: [fakeTool("real")],
+          authTools: [{
+            name: "google_auth_exchange", description: "", inputSchema: { type: "object" },
+            handler: async () => [{ type: "text" as const, text: JSON.stringify({ status: exchangeWorks ? "authenticated" : "error" }) }],
+          }],
+        };
+      },
+    });
+    await new Promise<void>((done) => server!.listen(0, "127.0.0.1", done));
+    const a = await connect(`http://127.0.0.1:${(server.address() as AddressInfo).port}`, "alpha-secret");
+    await a.listTools();
+    const before = builds;
+    await a.callTool({ name: "google_auth_exchange", arguments: { code: "junk" } });
+    await a.listTools();
+    expect(builds).toBe(before);
+    exchangeWorks = true;
+    await a.callTool({ name: "google_auth_exchange", arguments: { code: "good" } });
+    await a.listTools();
+    expect(builds).toBe(before + 1);
+    await a.close();
   });
 
   it("keeps secrets and host paths out of errors", async () => {
@@ -438,7 +559,7 @@ describe("broker errors and re-login", () => {
           tools: [fakeTool("real")],
           authTools: [{
             name: "google_auth_exchange", description: "", inputSchema: { type: "object" },
-            handler: async () => [{ type: "text" as const, text: "{}" }],
+            handler: async () => [{ type: "text" as const, text: JSON.stringify({ status: "authenticated" }) }],
           }],
         };
       },
@@ -479,6 +600,10 @@ describe("cleanErrorText", () => {
   it("keeps a long JSON payload readable", () => {
     const out = cleanErrorText(JSON.stringify({ status: "auth_expired", detail: "x".repeat(5000) }));
     expect(JSON.parse(out).status).toBe("auth_expired");
+  });
+  it("leaves ordinary text that looks a bit like a secret", () => {
+    expect(cleanErrorText("Basic plan required")).toBe("Basic plan required");
+    expect(cleanErrorText("due 4/04/2026")).toBe("due 4/04/2026");
   });
   it("leaves ordinary errors and URLs alone", () => {
     expect(cleanErrorText("access_token: must be set")).toBe("access_token: must be set");

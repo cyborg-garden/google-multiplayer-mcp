@@ -22,21 +22,34 @@ describe("checkToolArgs", () => {
     [{ name: "n", content: null }, /content is required/],
     [{ name: "n", content: 123 }, /content must be/],
     [{ name: "n", content: {} }, /content must be/],
-    [{ ...ok, folderId: "" }, /folderId can't be empty/],
     [{ ...ok, folderId: " " }, /folderId can't be empty/],
     [{ ...ok, folderId: 0 }, /folderId must be/],
-    [{ ...ok, pageSize: "5" }, /pageSize must be/],
-    [{ ...ok, headers: "a" }, /headers must be/],
-    [{ ...ok, headers: [1] }, /headers must only/],
+    [{ ...ok, folderId: "." }, /isn't a valid ID/],
+    [{ ...ok, folderId: ".." }, /isn't a valid ID/],
+    [{ ...ok, pageSize: "lots" }, /pageSize must be/],
+    [{ ...ok, pageSize: "" }, /pageSize must be/],
+    [{ ...ok, headers: [{}] }, /headers must only/],
     [{ ...ok, role: "owner" }, /role must be one of/],
   ])("refuses %j", (args, message) => {
-    expect(checkToolArgs(schema, args as Record<string, unknown>)).toMatch(message);
+    expect(checkToolArgs(schema, args as Record<string, unknown>).problem).toMatch(message);
+  });
+
+  it("refuses an empty required ID", () => {
+    const needsId = { type: "object", required: ["fileId"], properties: { fileId: { type: "string" } } };
+    expect(checkToolArgs(needsId, { fileId: "" }).problem).toMatch(/fileId can't be empty/);
   });
 
   it("accepts good arguments, an empty body, and null for optional ones", () => {
-    expect(checkToolArgs(schema, ok)).toBeNull();
-    expect(checkToolArgs(schema, { name: "n", content: "" })).toBeNull();
-    expect(checkToolArgs(schema, { ...ok, folderId: null, pageSize: 5, headers: ["a"], role: "writer" })).toBeNull();
+    expect(checkToolArgs(schema, ok)).toEqual({ args: ok, problem: null });
+    expect(checkToolArgs(schema, { name: "n", content: "" }).problem).toBeNull();
+    expect(checkToolArgs(schema, { ...ok, folderId: null, pageSize: 5, headers: ["a"], role: "writer" }).problem).toBeNull();
+  });
+
+  it("repairs harmless slips from an LLM", () => {
+    const { args, problem } = checkToolArgs(schema, { ...ok, pageSize: "10", headers: "INBOX", folderId: "" });
+    expect(problem).toBeNull();
+    expect(args).toEqual({ ...ok, pageSize: 10, headers: ["INBOX"] });
+    expect(checkToolArgs(schema, { ...ok, headers: [1, 2] }).args.headers).toEqual(["1", "2"]);
   });
 });
 
@@ -47,6 +60,13 @@ describe("dispatchToolCall", () => {
     const result = await dispatchToolCall("t", { name: "n", content: 123 }, [tool], []);
     expect(result.isError).toBe(true);
     expect(handler).not.toHaveBeenCalled();
+  });
+
+  it("passes repaired arguments to the tool", async () => {
+    const handler = vi.fn(async () => ({}));
+    const tool: ToolDef = { name: "t", description: "", service: "drive", requiredAccess: "write", inputSchema: schema, handler };
+    await dispatchToolCall("t", { ...ok, pageSize: "3", folderId: "" }, [tool], []);
+    expect(handler).toHaveBeenCalledWith({ ...ok, pageSize: 3 });
   });
 
   it("marks a failed auth tool as an error, and keeps its payload", async () => {

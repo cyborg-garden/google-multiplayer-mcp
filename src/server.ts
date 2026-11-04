@@ -57,34 +57,64 @@ export interface AuthToolDef {
 /**
  * Check tool arguments against the tool's schema. The low-level MCP server
  * doesn't, and a wrong type can reach code that fails outside any try/catch.
- * An empty ID is refused because tools read it as "not given", which would
- * skip their folder check. Returns what's wrong, or null.
+ *
+ * Harmless slips from an LLM are repaired: numbers sent as strings, a single
+ * value where a list goes, and an empty optional ID, which means "not given".
+ * An ID of `.` or `..` is refused, because in a URL it changes which Google
+ * endpoint is called.
  */
 export function checkToolArgs(
   schema: Record<string, unknown>,
   args: Record<string, unknown>,
-): string | null {
+): { args: Record<string, unknown>; problem: string | null } {
   const properties = (schema.properties ?? {}) as Record<
     string,
     { type?: string; enum?: unknown[]; items?: { type?: string } }
   >;
   const required = (schema.required ?? []) as string[];
   const typeOf = (v: unknown) => (Array.isArray(v) ? "array" : typeof v);
-  for (const name of required) {
-    if (args[name] === undefined || args[name] === null) return `${name} is required`;
-  }
-  for (const [name, value] of Object.entries(args)) {
+  const bad = (problem: string) => ({ args, problem });
+  const out: Record<string, unknown> = { ...args };
+
+  for (const [name, original] of Object.entries(args)) {
     const spec = properties[name];
-    if (!spec || value === undefined || value === null) continue;
+    if (!spec || original === undefined || original === null) continue;
+    const isId = /Id$/.test(name);
+    let value = original;
     const wanted = spec.type === "integer" ? "number" : spec.type;
-    if (wanted && typeOf(value) !== wanted) return `${name} must be of type ${spec.type}`;
-    if (spec.enum && !spec.enum.includes(value)) return `${name} must be one of: ${spec.enum.join(", ")}`;
-    if (wanted === "string" && /Id$/.test(name) && !(value as string).trim()) return `${name} can't be empty`;
-    if (wanted === "array" && spec.items?.type && (value as unknown[]).some((v) => typeOf(v) !== spec.items!.type)) {
-      return `${name} must only contain type ${spec.items.type}`;
+
+    if (wanted === "number" && typeof value === "string" && value.trim() !== "" && Number.isFinite(Number(value))) {
+      value = Number(value);
     }
+    if (wanted === "boolean" && (value === "true" || value === "false")) value = value === "true";
+    if (wanted === "array" && spec.items?.type === "string" && typeof value === "string") value = [value];
+    if (wanted && typeOf(value) !== wanted) return bad(`${name} must be of type ${spec.type}`);
+    if (spec.enum && !spec.enum.includes(value)) return bad(`${name} must be one of: ${spec.enum.join(", ")}`);
+
+    if (wanted === "string" && isId) {
+      if (value === "" && !required.includes(name)) {
+        delete out[name];
+        continue;
+      }
+      if (!(value as string).trim()) return bad(`${name} can't be empty`);
+      if (/^\.+$/.test(value as string)) return bad(`${name} isn't a valid ID`);
+    }
+
+    if (wanted === "array" && spec.items?.type) {
+      const wantedItem = spec.items.type;
+      const items = (value as unknown[]).map((v) =>
+        wantedItem === "string" && (typeof v === "number" || typeof v === "boolean") ? String(v) : v,
+      );
+      if (items.some((v) => typeOf(v) !== wantedItem)) return bad(`${name} must only contain type ${wantedItem}`);
+      value = items;
+    }
+    out[name] = value;
   }
-  return null;
+
+  for (const name of required) {
+    if (out[name] === undefined || out[name] === null) return bad(`${name} is required`);
+  }
+  return { args: out, problem: null };
 }
 
 /**
@@ -128,7 +158,7 @@ export async function dispatchToolCall(
     };
   }
 
-  const problem = checkToolArgs(tool.inputSchema, args ?? {});
+  const { args: checked, problem } = checkToolArgs(tool.inputSchema, args ?? {});
   if (problem) {
     return {
       content: [{ type: "text" as const, text: JSON.stringify({ status: "error", message: `Invalid arguments: ${problem}` }, null, 2) }],
@@ -137,7 +167,7 @@ export async function dispatchToolCall(
   }
 
   try {
-    const result = await tool.handler(args ?? {});
+    const result = await tool.handler(checked);
     return {
       content: [
         { type: "text" as const, text: JSON.stringify(result, null, 2) },

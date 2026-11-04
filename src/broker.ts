@@ -7,7 +7,7 @@
  */
 
 import { createHash, timingSafeEqual } from "crypto";
-import { appendFileSync, readFileSync, realpathSync, statSync } from "fs";
+import { appendFileSync, existsSync, readFileSync, realpathSync, renameSync, statSync } from "fs";
 import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from "http";
 import { dirname, isAbsolute, resolve } from "path";
 import yaml from "js-yaml";
@@ -33,7 +33,10 @@ const GOOGLE_TIMEOUT_MS = 120_000;
 const TOOL_DEADLINE_MS = 240_000;
 /** A client that stops reading can't hold its place for longer than this. */
 const REQUEST_DEADLINE_MS = 270_000;
-const MAX_CONNECTIONS = 128;
+/** High on purpose: agents share an address, so idle sockets can't be told apart. */
+const MAX_CONNECTIONS = 2048;
+const MAX_REQUESTS_PER_SECOND = 20;
+const MAX_AUDIT_BYTES = 64 * 1024 * 1024;
 const LOOPBACK = new Set(["127.0.0.1", "::1", "localhost"]);
 /** Fields naming people, audited as a list however they were written. */
 const AUDITED_RECIPIENTS = new Set(["to", "cc", "bcc", "attendees"]);
@@ -67,6 +70,8 @@ export interface BrokerConfig {
   maxInFlightPerAgent?: number;
   maxInFlightTotal?: number;
   toolDeadlineMs?: number;
+  maxRequestsPerSecond?: number;
+  maxAuditBytes?: number;
   requestDeadlineMs?: number;
   agents: BrokerAgent[];
 }
@@ -256,8 +261,10 @@ const SECRET_KEY = /^(client_?secret|refresh_?token|access_?token|id_?token|priv
 function cleanString(text: string): string {
   return text
     .replace(/-----BEGIN[\s\S]*?(-----END[^-]*-----|$)/g, "<redacted>")
-    .replace(/\b(Bearer|Basic)\s+\S+/gi, "$1 <redacted>")
-    .replace(/\b(ya29\.|GOCSPX-|1\/\/|4\/0)[\w./-]+/g, "<redacted>")
+    .replace(/\bBearer\s+\S+/gi, "Bearer <redacted>")
+    .replace(/\bBasic\s+[A-Za-z0-9+/=]{12,}/gi, "Basic <redacted>")
+    .replace(/\b(ya29\.|GOCSPX-)[\w./-]+/g, "<redacted>")
+    .replace(/\b(1\/\/|4\/0A)[\w./-]{10,}/g, "<redacted>")
     .replace(
       /"?\b(client_?secret|refresh_?token|access_?token|id_?token|private_?key|assertion|code)\b"?\s*(=\s*[^\s",&}]+|:\s*"[^"]*"|:\s*'[^']*'|:\s*[^\s",}]{16,})/gi,
       "$1: <redacted>",
@@ -310,10 +317,11 @@ function auditArgs(args: Record<string, unknown> | undefined): Record<string, un
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(args ?? {})) {
     if (AUDITED_ARGS.has(k) && typeof v === "string" && AUDITABLE_VALUE.test(v)) out[k] = v;
-    if (AUDITED_RECIPIENTS.has(k)) {
-      const items = Array.isArray(v) ? v : String(v ?? "").split(/[,;]/);
-      const people = items.map((i) => String(i).slice(0, 256).trim()).filter(Boolean);
-      out[k] = { count: people.length, first: people.slice(0, 20) };
+    if (AUDITED_RECIPIENTS.has(k) && (typeof v === "string" || Array.isArray(v))) {
+      // Addresses only, so a recipient field can't carry content into the log.
+      const text = (Array.isArray(v) ? v.filter((i) => typeof i === "string") : [v]).join(" ");
+      const people = text.match(/[\w.+-]{1,64}@[\w.-]{1,190}/g) ?? [];
+      out[k] = { count: people.length, first: people.slice(0, 5) };
     }
   }
   return out;
@@ -370,9 +378,32 @@ export function createBroker(config: BrokerConfig, options: BrokerOptions = {}):
   let totalInFlight = 0;
   const lastLogged = new Map<string, { at: number; suppressed: number }>();
 
+  const maxAuditBytes = config.maxAuditBytes ?? MAX_AUDIT_BYTES;
+  let auditBytes = existsSync(config.auditLog) ? statSync(config.auditLog).size : 0;
+  const recent = new Map<string, { second: number; count: number }>();
+
+  /** No agent can drive the broker, or the log, faster than this. */
+  const overRate = (name: string): boolean => {
+    const second = Math.floor(Date.now() / 1000);
+    const entry = recent.get(name);
+    if (!entry || entry.second !== second) {
+      recent.set(name, { second, count: 1 });
+      return false;
+    }
+    entry.count++;
+    return entry.count > (config.maxRequestsPerSecond ?? MAX_REQUESTS_PER_SECOND);
+  };
+
   const audit = (event: Record<string, unknown>): boolean => {
     try {
-      appendFileSync(config.auditLog, JSON.stringify({ ts: new Date().toISOString(), ...event }) + "\n", { mode: 0o600 });
+      const line = JSON.stringify({ ts: new Date().toISOString(), ...event }) + "\n";
+      // Keep one old file, so the log can't fill the disk.
+      if (auditBytes + line.length > maxAuditBytes) {
+        renameSync(config.auditLog, `${config.auditLog}.1`);
+        auditBytes = 0;
+      }
+      appendFileSync(config.auditLog, line, { mode: 0o600 });
+      auditBytes += line.length;
       return true;
     } catch (err) {
       console.error(`broker: audit write failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -407,6 +438,11 @@ export function createBroker(config: BrokerConfig, options: BrokerOptions = {}):
     return {
       release,
       hold: () => {
+        // The client left before the tool started, so this is a fresh place.
+        if (holds === 0) {
+          inFlight.set(name, (inFlight.get(name) ?? 0) + 1);
+          totalInFlight++;
+        }
         holds++;
         let released = false;
         return () => {
@@ -449,6 +485,7 @@ export function createBroker(config: BrokerConfig, options: BrokerOptions = {}):
     slot: ReturnType<typeof takeSlot>,
   ) => {
     const { tools, authTools } = await toolsFor(agent);
+    if (res.destroyed || res.closed) return;
     const server = new Server(
       { name: "google-multiplayer-mcp", version: "0.1.0" },
       { capabilities: { tools: {} } },
@@ -464,6 +501,10 @@ export function createBroker(config: BrokerConfig, options: BrokerOptions = {}):
       const { name, arguments: args } = request.params;
       const started = Date.now();
       const tool = name.slice(0, 128);
+      if (![...tools, ...authTools].some((t) => t.name === name)) {
+        auditLimited(`unknown:${agent.name}`, { event: "unknown_tool", agent: agent.name, tool });
+        return { content: [{ type: "text" as const, text: `Unknown tool: ${tool}` }], isError: true };
+      }
       // Record the call before it runs, and don't run what can't be recorded.
       if (!audit({ event: "call", agent: agent.name, tool, args: auditArgs(args) })) {
         return {
@@ -487,7 +528,8 @@ export function createBroker(config: BrokerConfig, options: BrokerOptions = {}):
         clearTimeout(timer);
         done();
       }
-      if (name === "google_auth_exchange") cache.delete(agent.name);
+      // Only a real new login needs a fresh check.
+      if (name === "google_auth_exchange" && !result.isError) cache.delete(agent.name);
       audit({ event: "done", agent: agent.name, tool, ok: !result.isError, ms: Date.now() - started });
       if (result.isError) {
         result.content = result.content.map((c) =>
@@ -510,7 +552,7 @@ export function createBroker(config: BrokerConfig, options: BrokerOptions = {}):
     await transport.handleRequest(req, res, body);
   };
 
-  const server = createServer((req, res) => {
+  const server = createServer({ connectionsCheckingInterval: 1000 }, (req, res) => {
     void (async () => {
       const path = (req.url ?? "/").split("?")[0];
       if (path === "/healthz") return reply(res, 200, { ok: true });
@@ -530,7 +572,7 @@ export function createBroker(config: BrokerConfig, options: BrokerOptions = {}):
       }
 
       // One agent can't use up the service for the others.
-      if ((inFlight.get(agent.name) ?? 0) >= maxPerAgent || totalInFlight >= maxTotal) {
+      if (overRate(agent.name) || (inFlight.get(agent.name) ?? 0) >= maxPerAgent || totalInFlight >= maxTotal) {
         auditLimited(`busy:${agent.name}`, { event: "refused", agent: agent.name, status: 429 });
         req.resume();
         return reply(res, 429, { error: "too many requests" });
@@ -570,7 +612,7 @@ export function createBroker(config: BrokerConfig, options: BrokerOptions = {}):
 
   // Connections with no secret are limited too, and don't get to wait around.
   server.maxConnections = MAX_CONNECTIONS;
-  server.headersTimeout = 10_000;
+  server.headersTimeout = 3_000;
   server.requestTimeout = 60_000;
   return server;
 }
@@ -594,7 +636,12 @@ export async function startBroker(configPath: string): Promise<void> {
   const server = createBroker(config);
   await new Promise<void>((done, reject) => {
     server.once("error", reject);
-    server.listen(config.port, config.host, done);
+    server.listen(config.port, config.host, () => {
+      server.off("error", reject);
+      // A later error, such as running out of file handles, mustn't end the service.
+      server.on("error", (err) => console.error(`broker: server error: ${err.message}`));
+      done();
+    });
   });
   console.error(`google-multiplayer-mcp broker: ${config.agents.length} agents on ${config.host}:${config.port}`);
 }
