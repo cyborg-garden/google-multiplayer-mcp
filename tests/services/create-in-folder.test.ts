@@ -63,6 +63,12 @@ describe("creating in a folder", () => {
     expect(_mocks.sheetsCreate).not.toHaveBeenCalled();
   });
 
+  it("falls back to the granted folder if a tool is handed an empty ID", async () => {
+    await tool(getSheetsTools(scoped("sheets"), {} as any), "sheets_create").handler({ title: "S", folderId: "" });
+    expect(_mocks.sheetsCreate).not.toHaveBeenCalled();
+    expect(_mocks.driveCreate.mock.calls[0][0].requestBody.parents).toEqual(["F1"]);
+  });
+
   it("uses the account's own storage when no folder applies", async () => {
     const d = await tool(getDocsTools(open("docs"), {} as any), "docs_create").handler({ title: "D" });
     const s = await tool(getSheetsTools(open("sheets"), {} as any), "sheets_create").handler({ title: "S" });

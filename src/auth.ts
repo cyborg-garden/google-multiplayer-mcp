@@ -131,6 +131,23 @@ export function createServiceAccountClient(
   });
 }
 
+/** Whether a login belongs to this account. Throws if Google can't say. */
+export async function isAccount(
+  client: InstanceType<typeof google.auth.OAuth2>,
+  expected: string,
+): Promise<boolean> {
+  let actual: string | null | undefined;
+  try {
+    const about = await google.drive({ version: "v3", auth: client }).about.get({ fields: "user(emailAddress)" });
+    actual = about.data.user?.emailAddress;
+  } catch {
+    // Some logins have Gmail but not Drive.
+    const profile = await google.gmail({ version: "v1", auth: client }).users.getProfile({ userId: "me" });
+    actual = profile.data.emailAddress;
+  }
+  return (actual ?? "").toLowerCase() === expected.toLowerCase();
+}
+
 /** Run the OAuth browser flow for an identity. */
 export async function runAuthFlow(identity: string): Promise<void> {
   const config = loadGlobalConfig();
@@ -365,11 +382,7 @@ export async function exchangeCode(
       throw new Error("Google returned no refresh token, so the existing login was kept.");
     }
     client.setCredentials(tokens);
-    const about = await google
-      .drive({ version: "v3", auth: client })
-      .about.get({ fields: "user(emailAddress)" });
-    const actual = about.data.user?.emailAddress ?? "";
-    if (actual.toLowerCase() !== expectedAccount.toLowerCase()) {
+    if (!(await isAccount(client, expectedAccount))) {
       throw new Error("That login is for a different account, so the existing login was kept.");
     }
   }

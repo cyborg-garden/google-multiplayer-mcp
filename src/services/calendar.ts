@@ -173,8 +173,10 @@ export function getCalendarTools(
           try {
             const found = await cal.calendars.get({ calendarId });
             calendars.push({ id: found.data.id, summary: found.data.summary, description: found.data.description });
-          } catch {
-            // Not shared with this identity, so it isn't available.
+          } catch (err) {
+            // Only "not shared with this identity" means it isn't available.
+            const status = (err as { code?: unknown }).code;
+            if (status !== 404 && status !== 403 && status !== "404" && status !== "403") throw err;
           }
         }
       }

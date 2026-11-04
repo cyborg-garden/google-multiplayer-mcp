@@ -106,7 +106,7 @@ agents:
   assistant:
     secret_sha256: <sha256 of the agent's secret, as hex>
     credential: {type: oauth, identity: assistant, expected_account: assistant@example.com}
-    allow_whole_account: true
+    allow_whole_account: [gmail]
     permissions:
       gmail: {access: read}
 ```
@@ -115,7 +115,7 @@ Connect an agent over MCP's streamable HTTP transport, at `/mcp` with the header
 
 **Service accounts** suit team folders. Share each folder or calendar with the service account, so Google itself refuses anything else. Sharing a Shared Drive folder as Content manager lets the agent move and delete files as well as edit them. They have no consent screen and no login to expire. They can't use Gmail, and they must list their folders.
 
-**OAuth** suits a real person's account. Tokens and the client come from the same `GOOGLE_TOKEN_DIR` and `GOOGLE_CLIENT_ID` settings as stdio mode. An agent can re-authenticate with `google_auth_url` and `google_auth_exchange`, and needs no reload afterwards. A new login is saved only if it's for `expected_account`, so an agent can't swap in another account.
+**OAuth** suits a real person's account. Tokens and the client come from the same `GOOGLE_TOKEN_DIR` and `GOOGLE_CLIENT_ID` settings as stdio mode. An agent can re-authenticate with `google_auth_url` and `google_auth_exchange`, and needs no reload afterwards. A new login is saved only if it's for `expected_account`, and a saved login is checked against it before use, so an agent can't swap in another account.
 
 **Rules the broker applies at startup:**
 
@@ -123,11 +123,11 @@ Connect an agent over MCP's streamable HTTP transport, at `/mcp` with the header
 - Each agent needs its own secret and its own credential.
 - `access` must be `none`, `read`, `write` or `admin`. Leaving it out means no access.
 - `folders` must be a list of IDs.
-- An OAuth agent with no folders listed must set `allow_whole_account: true`. Gmail always needs it, because folders can't limit Gmail.
+- An OAuth agent must name each service with no folder limit in `allow_whole_account`. Gmail always needs this, because folders can't limit Gmail.
 - Listening beyond loopback needs `allow_non_loopback: true`.
 - The audit log must be writable.
 
-**Limits:** 8 requests at once per agent, 32 in total, a 32 MB request body by default, a 32 MB download and a two-minute Google timeout.
+**Limits:** 8 requests at once per agent and 32 in total, counted until the work ends even if the client disconnects. Also one JSON-RPC message per request, a 32 MB request body by default, a 32 MB Drive download, 128 connections, a two-minute timeout per Google request with no retries, and four minutes per tool call. An agent should retry a call that Google refuses for being busy.
 
 **Audit log:** one JSON line when a call starts, and one when it ends, with the agent, tool, result, time taken and IDs such as `fileId`. It never records content, names or secrets. If the log can't be written, the call isn't run. Refused requests are logged as `denied` or `refused`.
 

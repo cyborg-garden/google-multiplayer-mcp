@@ -128,7 +128,7 @@ export function getSheetsTools(
 
         // With a folder, create it there through Drive. A service account has
         // no storage of its own, so sheets.spreadsheets.create would be refused.
-        const targetFolder = folderId ?? (allowedFolders.length > 0 ? allowedFolders[0] : null);
+        const targetFolder = folderId || (allowedFolders.length > 0 ? allowedFolders[0] : null);
         let spreadsheetId: string;
         if (targetFolder) {
           const createRes = await drive.files.create({

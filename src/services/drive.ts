@@ -315,7 +315,7 @@ export function getDriveTools(
         }
 
         const requestBody: Record<string, unknown> = { name, mimeType };
-        const targetFolder = folderId ?? (allowedFolders.length > 0 ? allowedFolders[0] : null);
+        const targetFolder = folderId || (allowedFolders.length > 0 ? allowedFolders[0] : null);
         if (targetFolder) requestBody.parents = [targetFolder];
 
         const res = await drive.files.create({
@@ -367,7 +367,7 @@ export function getDriveTools(
           name,
           mimeType: "application/vnd.google-apps.folder",
         };
-        const targetParent = parentId ?? (allowedFolders.length > 0 ? allowedFolders[0] : null);
+        const targetParent = parentId || (allowedFolders.length > 0 ? allowedFolders[0] : null);
         if (targetParent) requestBody.parents = [targetParent];
 
         const res = await drive.files.create({

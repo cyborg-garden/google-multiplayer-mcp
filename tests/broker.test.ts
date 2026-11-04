@@ -4,6 +4,7 @@ import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs"
 import type { AddressInfo } from "net";
 import type { Server as HttpServer } from "http";
 import { tmpdir } from "os";
+import { connect as connectSocket } from "net";
 import { join } from "path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -55,7 +56,7 @@ async function start(tools: Record<string, AgentTools>, overrides: Partial<Broke
     agents: [agent("alpha", "alpha-secret"), agent("beta", "beta-secret")],
     ...overrides,
   };
-  server = createBroker(config, { build: (a) => tools[a.name] });
+  server = createBroker(config, { build: (a) => tools[a.name], verifyLogin: async () => true });
   await new Promise<void>((done) => server!.listen(0, "127.0.0.1", done));
   return { url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, config };
 }
@@ -216,6 +217,129 @@ describe("broker requests", () => {
     await b.close();
   });
 
+  it("refuses a batch, and anything that isn't one message", async () => {
+    let runs = 0;
+    const { url } = await start({ alpha: { tools: [fakeTool("t", async () => { runs++; return {}; })], authTools: [] } });
+    const headers = { Authorization: "Bearer alpha-secret", "Content-Type": "application/json", Accept: "application/json, text/event-stream" };
+    const call = (id: number) => ({ jsonrpc: "2.0", id, method: "tools/call", params: { name: "t", arguments: {} } });
+    for (const body of [[call(1), call(2)], [], 5, "x", null]) {
+      const res = await fetch(`${url}/mcp`, { method: "POST", headers, body: JSON.stringify(body) });
+      expect(res.status).toBe(400);
+    }
+    expect(runs).toBe(0);
+  });
+
+  it("keeps a place taken until the tool ends, even if the client has gone", async () => {
+    let release = () => {};
+    const gate = new Promise<void>((done) => { release = done; });
+    const { url } = await start(
+      { alpha: { tools: [fakeTool("slow", async () => { await gate; return {}; }), fakeTool("quick")], authTools: [] } },
+      { maxInFlightPerAgent: 1 },
+    );
+    const headers = { Authorization: "Bearer alpha-secret", "Content-Type": "application/json", Accept: "application/json, text/event-stream" };
+    const body = (name: string) => JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: {} } });
+    const dropped = new AbortController();
+    const first = fetch(`${url}/mcp`, { method: "POST", headers, body: body("slow"), signal: dropped.signal }).catch(() => null);
+    await new Promise((done) => setTimeout(done, 50));
+    dropped.abort();
+    await first;
+    await new Promise((done) => setTimeout(done, 50));
+    expect((await fetch(`${url}/mcp`, { method: "POST", headers, body: body("quick") })).status).toBe(429);
+    release();
+    await new Promise((done) => setTimeout(done, 50));
+    expect((await fetch(`${url}/mcp`, { method: "POST", headers, body: body("quick") })).status).toBe(200);
+  });
+
+  it("gives up on a tool that never ends, and frees its place", async () => {
+    const { url } = await start(
+      { alpha: { tools: [fakeTool("stuck", () => new Promise(() => {})), fakeTool("quick")], authTools: [] } },
+      { toolDeadlineMs: 50, maxInFlightPerAgent: 1 },
+    );
+    const a = await connect(url, "alpha-secret");
+    expect((await a.callTool({ name: "stuck", arguments: {} })).isError).toBe(true);
+    expect((await a.callTool({ name: "quick", arguments: {} })).isError).toBeFalsy();
+    await a.close();
+  });
+
+  it("drops a client that holds a request open past the deadline", async () => {
+    const { url } = await start({ alpha: { tools: [], authTools: [] } }, { requestDeadlineMs: 50, maxInFlightPerAgent: 1 });
+    const { port } = new URL(url);
+    const closed = await new Promise<boolean>((done) => {
+      const socket = connectSocket(Number(port), "127.0.0.1", () => {
+        socket.write("POST /mcp HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer alpha-secret\r\nContent-Length: 100\r\n\r\n{");
+      });
+      socket.on("close", () => done(true));
+      socket.on("error", () => {});
+      setTimeout(() => done(false), 2000);
+    });
+    expect(closed).toBe(true);
+    const res = await fetch(`${url}/mcp`, { method: "POST", headers: { Authorization: "Bearer alpha-secret" }, body: "{bad" });
+    expect(res.status).toBe(400);
+  });
+
+  it("closes the connection on an oversized body, without reading the rest", async () => {
+    const { url } = await start({ alpha: { tools: [], authTools: [] } }, { maxBodyBytes: 100 });
+    const { port } = new URL(url);
+    for (const declared of [true, false]) {
+      const out = await new Promise<{ text: string; closed: boolean }>((done) => {
+        let text = "";
+        const socket = connectSocket(Number(port), "127.0.0.1", () => {
+          const length = declared ? "Content-Length: 5000\r\n" : "Transfer-Encoding: chunked\r\n";
+          const start = declared ? "" : "c8\r\n";
+          socket.write(`POST /mcp HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer alpha-secret\r\n${length}\r\n${start}${"x".repeat(200)}`);
+        });
+        socket.on("data", (d) => { text += d.toString(); });
+        socket.on("close", () => done({ text, closed: true }));
+        socket.on("error", () => {});
+        setTimeout(() => done({ text, closed: false }), 2000);
+      });
+      expect(out.text).toContain("413");
+      expect(out.closed).toBe(true);
+    }
+  });
+
+  it("limits connections", async () => {
+    await start({ alpha: { tools: [], authTools: [] } });
+    expect(server!.maxConnections).toBeGreaterThan(0);
+    expect(server!.headersTimeout).toBeLessThanOrEqual(10_000);
+  });
+
+  it("refuses a saved login for the wrong account, and rechecks it", async () => {
+    let result: boolean | Error = false;
+    const config: BrokerConfig = {
+      host: "127.0.0.1", port: 0, auditLog: join(dir, "audit.jsonl"), maxBodyBytes: 1024,
+      agents: [agent("alpha", "alpha-secret")],
+    };
+    const authTool = { name: "google_auth_status", description: "", inputSchema: { type: "object" }, handler: async () => [] };
+    server = createBroker(config, {
+      build: () => ({ tools: [fakeTool("real")], authTools: [authTool] }),
+      verifyLogin: async () => {
+        if (result instanceof Error) throw result;
+        return result;
+      },
+    });
+    await new Promise<void>((done) => server!.listen(0, "127.0.0.1", done));
+    const a = await connect(`http://127.0.0.1:${(server.address() as AddressInfo).port}`, "alpha-secret");
+    expect((await a.listTools()).tools.map((t) => t.name)).toEqual(["google_auth_status"]);
+    expect(auditLines()).toContainEqual(expect.objectContaining({ event: "login_refused", agent: "alpha" }));
+    result = new Error("network");
+    expect((await a.listTools()).tools.map((t) => t.name)).toEqual(["google_auth_status"]);
+    result = true;
+    expect((await a.listTools()).tools.map((t) => t.name)).toEqual(["real", "google_auth_status"]);
+    await a.close();
+  });
+
+  it("audits every recipient, however it was written", async () => {
+    const { url } = await start({ alpha: { tools: [fakeTool("t")], authTools: [] } });
+    const a = await connect(url, "alpha-secret");
+    await a.callTool({ name: "t", arguments: { to: "boss@x.example, hidden@y.example", attendees: ["c@z.example"] } });
+    await a.close();
+    expect(auditLines()[0].args).toEqual({
+      to: { count: 2, first: ["boss@x.example", "hidden@y.example"] },
+      attendees: { count: 1, first: ["c@z.example"] },
+    });
+  });
+
   it("keeps secrets and host paths out of errors", async () => {
     const { url } = await start({
       alpha: {
@@ -238,6 +362,7 @@ describe("broker requests", () => {
     };
     let loggedIn = false;
     server = createBroker(config, {
+      verifyLogin: async () => true,
       build: () => {
         builds++;
         return {
@@ -306,6 +431,7 @@ describe("broker errors and re-login", () => {
       agents: [agent("alpha", "alpha-secret")],
     };
     server = createBroker(config, {
+      verifyLogin: async () => true,
       build: () => {
         builds++;
         return {
@@ -343,6 +469,26 @@ describe("cleanErrorText", () => {
     expect(cleanErrorText("File not found: 1UyHc-d_w.")).toContain("1UyHc-d_w");
     expect(cleanErrorText("x".repeat(5000))).toHaveLength(2000);
   });
+  it("cleans secrets inside a JSON payload, where quotes are escaped", () => {
+    const payload = JSON.stringify({ status: "error", detail: '{"client_secret":"s3cret","refresh_token":"r3fresh"}' });
+    const out = cleanErrorText(payload);
+    expect(out).not.toContain("s3cret");
+    expect(out).not.toContain("r3fresh");
+    expect(JSON.parse(out).status).toBe("error");
+  });
+  it("keeps a long JSON payload readable", () => {
+    const out = cleanErrorText(JSON.stringify({ status: "auth_expired", detail: "x".repeat(5000) }));
+    expect(JSON.parse(out).status).toBe("auth_expired");
+  });
+  it("leaves ordinary errors and URLs alone", () => {
+    expect(cleanErrorText("access_token: must be set")).toBe("access_token: must be set");
+    expect(cleanErrorText("see https://www.googleapis.com/drive/v3/files")).toContain("https://www.googleapis.com/drive/v3/files");
+  });
+  it.each(["/srv/a/key.json", "/Volumes/x/y", "path=/Users/a/b", "C:\\Users\\a"])("hides the path %s", (path) => {
+    const out = cleanErrorText(`failed at ${path}`);
+    expect(out).toContain("<path>");
+    expect(out).not.toContain(path);
+  });
 });
 
 describe("findAgent", () => {
@@ -373,7 +519,7 @@ describe("broker config", () => {
   it.each(["false", "{x: 1}", "5", "F1", "['']", "[null]"])("refuses folders: %s", (value) => {
     key();
     expect(() => parseBrokerConfig(yml(sa(`      drive: {access: write, folders: ${value}}\n`)), dir)).toThrow(/list of IDs/);
-    const oauth = yml(`  p:\n    secret_sha256: ${hash("s")}\n    credential: {type: oauth, identity: p, expected_account: a@b.example}\n    allow_whole_account: true\n    permissions:\n      drive: {access: write, folders: ${value}}\n`);
+    const oauth = yml(`  p:\n    secret_sha256: ${hash("s")}\n    credential: {type: oauth, identity: p, expected_account: a@b.example}\n    allow_whole_account: [drive]\n    permissions:\n      drive: {access: write, folders: ${value}}\n`);
     expect(() => parseBrokerConfig(oauth, dir)).toThrow(/list of IDs/);
   });
 
@@ -387,7 +533,21 @@ describe("broker config", () => {
       yml(`  p:\n    secret_sha256: ${hash("s")}\n    credential: {type: oauth, identity: p, expected_account: a@b.example}\n${extra}    permissions:\n      gmail: ${gmail}\n`);
     expect(() => parseBrokerConfig(y("", "{access: admin, folders: [x]}"), dir)).toThrow(/Gmail has no folders/);
     expect(() => parseBrokerConfig(y("", "{access: read}"), dir)).toThrow(/allow_whole_account/);
-    expect(parseBrokerConfig(y("    allow_whole_account: true\n", "{access: read}"), dir).agents).toHaveLength(1);
+    expect(parseBrokerConfig(y("    allow_whole_account: [gmail]\n", "{access: read}"), dir).agents).toHaveLength(1);
+  });
+
+  it("makes each unlimited service ask by name", () => {
+    const y = (whole: string) =>
+      yml(`  p:\n    secret_sha256: ${hash("s")}\n    credential: {type: oauth, identity: p, expected_account: a@b.example}\n    allow_whole_account: ${whole}\n    permissions:\n      gmail: {access: read}\n      drive: {access: admin}\n`);
+    expect(() => parseBrokerConfig(y("[gmail]"), dir)).toThrow(/no folders for drive/);
+    expect(() => parseBrokerConfig(y("true"), dir)).toThrow(/must list services/);
+    expect(parseBrokerConfig(y("[gmail, drive]"), dir).agents).toHaveLength(1);
+  });
+
+  it("refuses identities that differ only by case", () => {
+    const o = (name: string, secret: string, identity: string) =>
+      `  ${name}:\n    secret_sha256: ${hash(secret)}\n    credential: {type: oauth, identity: ${identity}, expected_account: a@b.example}\n`;
+    expect(() => parseBrokerConfig(yml(o("a", "1", "Bob") + o("b", "2", "bob")), dir)).toThrow(/shares/);
   });
 
   it("refuses shared credentials, and identities that escape the token folder", () => {
@@ -451,7 +611,7 @@ describe("broker config", () => {
     const oauth = (extra = "") =>
       yml(`  p:\n    secret_sha256: ${hash("s")}\n    credential: {type: oauth, identity: p, expected_account: a@b.example}\n${extra}    permissions:\n      drive: {access: write}\n`);
     expect(() => parseBrokerConfig(oauth(), dir)).toThrow(/allow_whole_account/);
-    expect(parseBrokerConfig(oauth("    allow_whole_account: true\n"), dir).agents[0].name).toBe("p");
+    expect(parseBrokerConfig(oauth("    allow_whole_account: [drive]\n"), dir).agents[0].name).toBe("p");
   });
 
   it("refuses bad and repeated secrets, and unknown types", () => {

@@ -7,7 +7,7 @@
  */
 
 import { createHash, timingSafeEqual } from "crypto";
-import { appendFileSync, readFileSync, statSync } from "fs";
+import { appendFileSync, readFileSync, realpathSync, statSync } from "fs";
 import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from "http";
 import { dirname, isAbsolute, resolve } from "path";
 import yaml from "js-yaml";
@@ -17,8 +17,9 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
+  type CallToolResult,
 } from "@modelcontextprotocol/sdk/types.js";
-import { createAuthClient, createServiceAccountClient } from "./auth.js";
+import { createAuthClient, createServiceAccountClient, isAccount } from "./auth.js";
 import { formatToolError, type ToolErrorPayload } from "./auth-errors.js";
 import { collectTools, dispatchToolCall, getAuthTools, type AuthToolDef } from "./server.js";
 import type { PermissionConfig, ServiceName, ServicePermission, ToolDef } from "./types.js";
@@ -28,7 +29,14 @@ const DEFAULT_MAX_BODY_BYTES = 32 * 1024 * 1024;
 const MAX_IN_FLIGHT_PER_AGENT = 8;
 const MAX_IN_FLIGHT_TOTAL = 32;
 const GOOGLE_TIMEOUT_MS = 120_000;
+/** Covers token calls too, which ignore the Google client timeout. */
+const TOOL_DEADLINE_MS = 240_000;
+/** A client that stops reading can't hold its place for longer than this. */
+const REQUEST_DEADLINE_MS = 270_000;
+const MAX_CONNECTIONS = 128;
 const LOOPBACK = new Set(["127.0.0.1", "::1", "localhost"]);
+/** Fields naming people, audited as a list however they were written. */
+const AUDITED_RECIPIENTS = new Set(["to", "cc", "bcc", "attendees"]);
 /** Audited values must look like an ID, so an agent can't stuff the log. */
 const AUDITABLE_VALUE = /^[\w@.+-]{1,256}$/;
 const SAFE_IDENTITY = /^[A-Za-z0-9_-]{1,64}$/;
@@ -38,7 +46,7 @@ const BROKER_AUTH_TOOLS = new Set(["google_auth_url", "google_auth_exchange", "g
 /** Tool arguments safe to audit. Everything else, such as content, is left out. */
 const AUDITED_ARGS = new Set([
   "fileId", "folderId", "parentId", "destinationFolderId", "documentId", "spreadsheetId",
-  "calendarId", "eventId", "messageId", "email", "role", "to",
+  "calendarId", "eventId", "messageId", "email", "role",
 ]);
 
 type ServiceAccountCredential = { type: "service_account"; keyFile: string };
@@ -58,6 +66,8 @@ export interface BrokerConfig {
   maxBodyBytes: number;
   maxInFlightPerAgent?: number;
   maxInFlightTotal?: number;
+  toolDeadlineMs?: number;
+  requestDeadlineMs?: number;
   agents: BrokerAgent[];
 }
 
@@ -124,7 +134,7 @@ export function parseBrokerConfig(yamlStr: string, baseDir: string): BrokerConfi
         fail(`agent "${name}" key file is missing`);
       }
       if (mode & 0o077) fail(`agent "${name}" key file must not be readable by group or others`);
-      once(name, `key:${keyFile}`);
+      once(name, `key:${realpathSync(keyFile)}`);
       return { name, secretSha256, credential: { type, keyFile }, permissions };
     }
 
@@ -138,10 +148,14 @@ export function parseBrokerConfig(yamlStr: string, baseDir: string): BrokerConfi
       if (typeof expectedAccount !== "string" || !expectedAccount.includes("@")) {
         fail(`agent "${name}" needs credential.expected_account`);
       }
-      once(name, `identity:${identity}`);
-      // An empty folder list means the whole account, so it must be asked for.
-      if (open.length > 0 && a.allow_whole_account !== true) {
-        fail(`agent "${name}" has no folders for ${open.join(", ")}; list them or set allow_whole_account`);
+      // Case can differ on a case-insensitive disk and still be one token file.
+      once(name, `identity:${identity.toLowerCase()}`);
+      // An empty folder list means the whole account, so each service asks for it by name.
+      const whole = a.allow_whole_account ?? [];
+      if (!Array.isArray(whole)) fail(`agent "${name}": allow_whole_account must list services, such as [gmail]`);
+      const unasked = open.filter((svc) => !whole.includes(svc));
+      if (unasked.length > 0) {
+        fail(`agent "${name}" has no folders for ${unasked.join(", ")}; list them or add to allow_whole_account`);
       }
       return { name, secretSha256, credential: { type, identity, expectedAccount }, permissions };
     }
@@ -195,6 +209,12 @@ export interface AgentTools {
   authTools: AuthToolDef[];
 }
 
+/** Whether an OAuth agent's saved login is the account it's pinned to. */
+async function savedLoginMatches(agent: BrokerAgent): Promise<boolean> {
+  if (agent.credential.type !== "oauth") return true;
+  return isAccount(createAuthClient(agent.credential.identity), agent.credential.expectedAccount);
+}
+
 /** Build an agent's tools against its own credential. */
 export function buildAgentTools(agent: BrokerAgent): AgentTools {
   const config: PermissionConfig = {
@@ -231,15 +251,45 @@ function serviceAccountError(err: unknown): ToolErrorPayload {
   };
 }
 
-/** Error text reaches an agent, so it carries no secret, host path or bulk. */
-export function cleanErrorText(text: string): string {
+const SECRET_KEY = /^(client_?secret|refresh_?token|access_?token|id_?token|private_?key|assertion)$/i;
+
+function cleanString(text: string): string {
   return text
     .replace(/-----BEGIN[\s\S]*?(-----END[^-]*-----|$)/g, "<redacted>")
-    .replace(/\b(Bearer\s+)\S+/gi, "$1<redacted>")
-    .replace(/\b(ya29\.|GOCSPX-|1\/\/)[\w./-]+/g, "<redacted>")
-    .replace(/"?\b(client_?secret|refresh_?token|access_?token|private_?key)\b"?\s*[:=]\s*"?[^\s",}]+/gi, "$1: <redacted>")
-    .replace(/(^|[\s"'(])\/(?:Users|home|opt|private|tmp|var|root|etc)\/[^\s"')]+/g, "$1<path>")
+    .replace(/\b(Bearer|Basic)\s+\S+/gi, "$1 <redacted>")
+    .replace(/\b(ya29\.|GOCSPX-|1\/\/|4\/0)[\w./-]+/g, "<redacted>")
+    .replace(
+      /"?\b(client_?secret|refresh_?token|access_?token|id_?token|private_?key|assertion|code)\b"?\s*(=\s*[^\s",&}]+|:\s*"[^"]*"|:\s*'[^']*'|:\s*[^\s",}]{16,})/gi,
+      "$1: <redacted>",
+    )
+    .replace(/(^|[\s"'(=:])\/(?:[\w.-]+\/)+[\w.-]*/g, "$1<path>")
+    .replace(/\b[A-Za-z]:\\[^\s"')]+/g, "<path>")
     .slice(0, 2000);
+}
+
+function cleanValue(value: unknown): unknown {
+  if (typeof value === "string") return cleanString(value);
+  if (Array.isArray(value)) return value.map(cleanValue);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([k, v]) => [k, SECRET_KEY.test(k) ? "<redacted>" : cleanValue(v)]),
+    );
+  }
+  return value;
+}
+
+/**
+ * Error text reaches an agent, so it carries no secret, host path or bulk.
+ * A JSON payload is cleaned field by field, so it stays readable.
+ */
+export function cleanErrorText(text: string): string {
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed === "object") return JSON.stringify(cleanValue(parsed), null, 2);
+  } catch {
+    // Plain text.
+  }
+  return cleanString(text);
 }
 
 function sha256(value: string): Buffer {
@@ -260,6 +310,11 @@ function auditArgs(args: Record<string, unknown> | undefined): Record<string, un
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(args ?? {})) {
     if (AUDITED_ARGS.has(k) && typeof v === "string" && AUDITABLE_VALUE.test(v)) out[k] = v;
+    if (AUDITED_RECIPIENTS.has(k)) {
+      const items = Array.isArray(v) ? v : String(v ?? "").split(/[,;]/);
+      const people = items.map((i) => String(i).slice(0, 256).trim()).filter(Boolean);
+      out[k] = { count: people.length, first: people.slice(0, 20) };
+    }
   }
   return out;
 }
@@ -268,17 +323,23 @@ class BodyTooLarge extends Error {}
 
 function readBody(req: IncomingMessage, limit: number): Promise<Buffer> {
   return new Promise((done, reject) => {
-    const chunks: Buffer[] = [];
+    if (Number(req.headers["content-length"] ?? 0) > limit) {
+      reject(new BodyTooLarge());
+      return;
+    }
+    let chunks: Buffer[] = [];
     let size = 0;
-    req.on("data", (chunk: Buffer) => {
+    const onData = (chunk: Buffer) => {
       size += chunk.length;
       if (size > limit) {
+        chunks = [];
+        req.off("data", onData);
         reject(new BodyTooLarge());
-        req.resume();
         return;
       }
       chunks.push(chunk);
-    });
+    };
+    req.on("data", onData);
     req.on("end", () => done(Buffer.concat(chunks)));
     req.on("error", reject);
   });
@@ -292,18 +353,22 @@ function reply(res: ServerResponse, status: number, body: unknown): void {
 export interface BrokerOptions {
   /** Replaces the Google-backed tool builder in tests. */
   build?: (agent: BrokerAgent) => AgentTools;
+  /** Replaces the check of an OAuth agent's saved login in tests. */
+  verifyLogin?: (agent: BrokerAgent) => Promise<boolean>;
 }
 
 export function createBroker(config: BrokerConfig, options: BrokerOptions = {}): HttpServer {
   const build = options.build ?? buildAgentTools;
+  const verifyLogin = options.verifyLogin ?? savedLoginMatches;
+  const toolDeadline = config.toolDeadlineMs ?? TOOL_DEADLINE_MS;
+  const requestDeadline = config.requestDeadlineMs ?? REQUEST_DEADLINE_MS;
   const cache = new Map<string, AgentTools>();
 
   const maxPerAgent = config.maxInFlightPerAgent ?? MAX_IN_FLIGHT_PER_AGENT;
   const maxTotal = config.maxInFlightTotal ?? MAX_IN_FLIGHT_TOTAL;
   const inFlight = new Map<string, number>();
   let totalInFlight = 0;
-  let lastDenied = 0;
-  let suppressedDenied = 0;
+  const lastLogged = new Map<string, { at: number; suppressed: number }>();
 
   const audit = (event: Record<string, unknown>): boolean => {
     try {
@@ -315,29 +380,75 @@ export function createBroker(config: BrokerConfig, options: BrokerOptions = {}):
     }
   };
 
-  // Callers with no secret can repeat this as fast as they like.
-  const auditDenied = () => {
+  // A caller can repeat a refused request as fast as it likes.
+  const auditLimited = (key: string, event: Record<string, unknown>) => {
     const now = Date.now();
-    if (now - lastDenied < 1000) {
-      suppressedDenied++;
+    const entry = lastLogged.get(key) ?? { at: 0, suppressed: 0 };
+    if (now - entry.at < 1000) {
+      entry.suppressed++;
+      lastLogged.set(key, entry);
       return;
     }
-    lastDenied = now;
-    audit({ event: "denied", suppressed: suppressedDenied });
-    suppressedDenied = 0;
+    audit({ ...event, suppressed: entry.suppressed });
+    lastLogged.set(key, { at: now, suppressed: 0 });
   };
 
-  const toolsFor = (agent: BrokerAgent): AgentTools => {
+  /** A place in the limits, held until the response and the tool have both finished. */
+  const takeSlot = (name: string) => {
+    inFlight.set(name, (inFlight.get(name) ?? 0) + 1);
+    totalInFlight++;
+    let holds = 1;
+    const release = () => {
+      if (--holds === 0) {
+        inFlight.set(name, (inFlight.get(name) ?? 1) - 1);
+        totalInFlight--;
+      }
+    };
+    return {
+      release,
+      hold: () => {
+        holds++;
+        let released = false;
+        return () => {
+          if (!released) {
+            released = true;
+            release();
+          }
+        };
+      },
+    };
+  };
+
+  const toolsFor = async (agent: BrokerAgent): Promise<AgentTools> => {
     const cached = cache.get(agent.name);
     if (cached) return cached;
     const built = build(agent);
+    if (built.tools.length > 0 && agent.credential.type === "oauth") {
+      // A token file can be replaced outside the broker, so check who it's for.
+      let matches = false;
+      try {
+        matches = await verifyLogin(agent);
+      } catch (err) {
+        console.error(`broker: couldn't check "${agent.name}" login: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      if (!matches) {
+        audit({ event: "login_refused", agent: agent.name });
+        return { tools: [], authTools: built.authTools };
+      }
+    }
     // A login-less OAuth agent gets rebuilt until a token appears.
     if (built.tools.length > 0 || built.authTools.length === 0) cache.set(agent.name, built);
     return built;
   };
 
-  const handleMcp = async (req: IncomingMessage, res: ServerResponse, agent: BrokerAgent, body: unknown) => {
-    const { tools, authTools } = toolsFor(agent);
+  const handleMcp = async (
+    req: IncomingMessage,
+    res: ServerResponse,
+    agent: BrokerAgent,
+    body: unknown,
+    slot: ReturnType<typeof takeSlot>,
+  ) => {
+    const { tools, authTools } = await toolsFor(agent);
     const server = new Server(
       { name: "google-multiplayer-mcp", version: "0.1.0" },
       { capabilities: { tools: {} } },
@@ -361,7 +472,21 @@ export function createBroker(config: BrokerConfig, options: BrokerOptions = {}):
         };
       }
       const formatError = agent.credential.type === "service_account" ? serviceAccountError : undefined;
-      const result = await dispatchToolCall(name, args, tools, authTools, formatError);
+      // Keep the place until the work ends, even if the client has gone.
+      const done = slot.hold();
+      let timer: NodeJS.Timeout | undefined;
+      const deadline = new Promise<CallToolResult>((resolve) => {
+        timer = setTimeout(() => {
+          resolve({ content: [{ type: "text" as const, text: "The call took too long and was abandoned." }], isError: true });
+        }, toolDeadline);
+      });
+      let result: CallToolResult;
+      try {
+        result = await Promise.race([dispatchToolCall(name, args, tools, authTools, formatError), deadline]);
+      } finally {
+        clearTimeout(timer);
+        done();
+      }
       if (name === "google_auth_exchange") cache.delete(agent.name);
       audit({ event: "done", agent: agent.name, tool, ok: !result.isError, ms: Date.now() - started });
       if (result.isError) {
@@ -385,7 +510,7 @@ export function createBroker(config: BrokerConfig, options: BrokerOptions = {}):
     await transport.handleRequest(req, res, body);
   };
 
-  return createServer((req, res) => {
+  const server = createServer((req, res) => {
     void (async () => {
       const path = (req.url ?? "/").split("?")[0];
       if (path === "/healthz") return reply(res, 200, { ok: true });
@@ -394,7 +519,7 @@ export function createBroker(config: BrokerConfig, options: BrokerOptions = {}):
       const header = req.headers.authorization ?? "";
       const agent = header.startsWith("Bearer ") ? findAgent(config.agents, header.slice(7)) : null;
       if (!agent) {
-        auditDenied();
+        auditLimited("denied", { event: "denied" });
         req.resume();
         return reply(res, 401, { error: "unauthorized" });
       }
@@ -405,34 +530,54 @@ export function createBroker(config: BrokerConfig, options: BrokerOptions = {}):
       }
 
       // One agent can't use up the service for the others.
-      const agentInFlight = inFlight.get(agent.name) ?? 0;
-      if (agentInFlight >= maxPerAgent || totalInFlight >= maxTotal) {
-        audit({ event: "refused", agent: agent.name, status: 429 });
+      if ((inFlight.get(agent.name) ?? 0) >= maxPerAgent || totalInFlight >= maxTotal) {
+        auditLimited(`busy:${agent.name}`, { event: "refused", agent: agent.name, status: 429 });
         req.resume();
         return reply(res, 429, { error: "too many requests" });
       }
-      inFlight.set(agent.name, agentInFlight + 1);
-      totalInFlight++;
-      res.once("close", () => {
-        inFlight.set(agent.name, (inFlight.get(agent.name) ?? 1) - 1);
-        totalInFlight--;
-      });
+      const slot = takeSlot(agent.name);
+      res.once("close", slot.release);
+      const deadline = setTimeout(() => req.socket.destroy(), requestDeadline);
+      deadline.unref();
+      res.once("close", () => clearTimeout(deadline));
 
       let body: unknown;
       try {
         body = JSON.parse((await readBody(req, config.maxBodyBytes)).toString("utf-8"));
       } catch (err) {
-        const status = err instanceof BodyTooLarge ? 413 : 400;
-        audit({ event: "refused", agent: agent.name, status });
-        return reply(res, status, { error: status === 413 ? "body too large" : "invalid JSON" });
+        if (err instanceof BodyTooLarge) {
+          // Don't keep reading, or holding memory for, a body we've refused.
+          auditLimited(`big:${agent.name}`, { event: "refused", agent: agent.name, status: 413 });
+          res.writeHead(413, { "Content-Type": "application/json", Connection: "close" });
+          res.end(JSON.stringify({ error: "body too large" }), () => req.socket.destroy());
+          return;
+        }
+        auditLimited(`bad:${agent.name}`, { event: "refused", agent: agent.name, status: 400 });
+        return reply(res, 400, { error: "invalid JSON" });
       }
-      await handleMcp(req, res, agent, body);
+      // One request, one message: a batch would run past the limits above.
+      if (!body || typeof body !== "object" || Array.isArray(body)) {
+        auditLimited(`bad:${agent.name}`, { event: "refused", agent: agent.name, status: 400 });
+        return reply(res, 400, { error: "send one JSON-RPC message per request" });
+      }
+      await handleMcp(req, res, agent, body, slot);
     })().catch((err) => {
       console.error(`broker: request failed: ${err instanceof Error ? err.message : String(err)}`);
       if (!res.headersSent) reply(res, 500, { error: "internal error" });
       else res.end();
     });
   });
+
+  // Connections with no secret are limited too, and don't get to wait around.
+  server.maxConnections = MAX_CONNECTIONS;
+  server.headersTimeout = 10_000;
+  server.requestTimeout = 60_000;
+  return server;
+}
+
+/** Google client settings for the broker. A retry would multiply the timeout. */
+export function configureGoogleClients(): void {
+  google.options({ timeout: GOOGLE_TIMEOUT_MS, retry: false });
 }
 
 export async function startBroker(configPath: string): Promise<void> {
@@ -445,7 +590,7 @@ export async function startBroker(configPath: string): Promise<void> {
   }
   // Refuse to start with no audit log, rather than run unrecorded.
   appendFileSync(config.auditLog, "", { mode: 0o600 });
-  google.options({ timeout: GOOGLE_TIMEOUT_MS });
+  configureGoogleClients();
   const server = createBroker(config);
   await new Promise<void>((done, reject) => {
     server.once("error", reject);

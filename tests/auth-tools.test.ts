@@ -43,6 +43,8 @@ describe("google_auth_exchange tool", () => {
 
   it("reports an error when no code is provided", async () => {
     const tool = findTool("personal", "google_auth_exchange");
-    await expect(tool.handler({ code: "" })).rejects.toThrow(/Code exchange failed/);
+    const content = await tool.handler({ code: "" });
+    const payload = JSON.parse(content[0].text);
+    expect(payload.status).toBe("error");
   });
 });

@@ -92,10 +92,17 @@ describe("calendar_list_calendars for an identity with an empty list", () => {
     _mocks.listCalendarsFn.mockResolvedValueOnce({ data: { items: [] } });
     _mocks.getCalendarFn.mockImplementation(async ({ calendarId }: { calendarId: string }) => {
       if (calendarId === "cal-a") return { data: { id: "cal-a", summary: "A" } };
-      throw new Error("Not Found");
+      throw Object.assign(new Error("Not Found"), { code: 404 });
     });
     const tool = getCalendarTools(config, {} as any).find((t: any) => t.name === "calendar_list_calendars");
     const res = await tool.handler({});
     expect(res.calendars.map((c: any) => c.id)).toEqual(["cal-a"]);
+  });
+
+  it("doesn't report a Google failure as not shared", async () => {
+    _mocks.listCalendarsFn.mockResolvedValueOnce({ data: { items: [] } });
+    _mocks.getCalendarFn.mockRejectedValue(Object.assign(new Error("Backend Error"), { code: 500 }));
+    const tool = getCalendarTools(config, {} as any).find((t: any) => t.name === "calendar_list_calendars");
+    await expect(tool.handler({})).rejects.toThrow("Backend Error");
   });
 });

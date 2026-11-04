@@ -38,11 +38,53 @@ export function collectTools(
 
 // ─── Auth MCP tool definitions ──────────────────────────────────
 
+/** Auth tools report a failure as `{status: "error"}`, as the re-auth skill expects. */
+function authResultFailed(content: { text: string }[]): boolean {
+  try {
+    return JSON.parse(content[0]?.text ?? "{}").status === "error";
+  } catch {
+    return false;
+  }
+}
+
 export interface AuthToolDef {
   name: string;
   description: string;
   inputSchema: Record<string, unknown>;
   handler: (args: Record<string, unknown>) => Promise<{ type: "text"; text: string }[]>;
+}
+
+/**
+ * Check tool arguments against the tool's schema. The low-level MCP server
+ * doesn't, and a wrong type can reach code that fails outside any try/catch.
+ * An empty ID is refused because tools read it as "not given", which would
+ * skip their folder check. Returns what's wrong, or null.
+ */
+export function checkToolArgs(
+  schema: Record<string, unknown>,
+  args: Record<string, unknown>,
+): string | null {
+  const properties = (schema.properties ?? {}) as Record<
+    string,
+    { type?: string; enum?: unknown[]; items?: { type?: string } }
+  >;
+  const required = (schema.required ?? []) as string[];
+  const typeOf = (v: unknown) => (Array.isArray(v) ? "array" : typeof v);
+  for (const name of required) {
+    if (args[name] === undefined || args[name] === null) return `${name} is required`;
+  }
+  for (const [name, value] of Object.entries(args)) {
+    const spec = properties[name];
+    if (!spec || value === undefined || value === null) continue;
+    const wanted = spec.type === "integer" ? "number" : spec.type;
+    if (wanted && typeOf(value) !== wanted) return `${name} must be of type ${spec.type}`;
+    if (spec.enum && !spec.enum.includes(value)) return `${name} must be one of: ${spec.enum.join(", ")}`;
+    if (wanted === "string" && /Id$/.test(name) && !(value as string).trim()) return `${name} can't be empty`;
+    if (wanted === "array" && spec.items?.type && (value as unknown[]).some((v) => typeOf(v) !== spec.items!.type)) {
+      return `${name} must only contain type ${spec.items.type}`;
+    }
+  }
+  return null;
 }
 
 /**
@@ -68,7 +110,7 @@ export async function dispatchToolCall(
   if (authTool) {
     try {
       const content = await authTool.handler(args ?? {});
-      return { content };
+      return { content, isError: authResultFailed(content) || undefined };
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       return {
@@ -82,6 +124,14 @@ export async function dispatchToolCall(
   if (!tool) {
     return {
       content: [{ type: "text" as const, text: `Unknown tool: ${name}` }],
+      isError: true,
+    };
+  }
+
+  const problem = checkToolArgs(tool.inputSchema, args ?? {});
+  if (problem) {
+    return {
+      content: [{ type: "text" as const, text: JSON.stringify({ status: "error", message: `Invalid arguments: ${problem}` }, null, 2) }],
       isError: true,
     };
   }
@@ -109,8 +159,8 @@ export function getAuthTools(
   { reloadNeeded = true, expectedAccount }: { reloadNeeded?: boolean; expectedAccount?: string } = {},
 ): AuthToolDef[] {
   const afterLogin = reloadNeeded
-    ? "Reload the MCP (HSM quick-restart) to activate the Google tools."
-    : "The Google tools are ready.";
+    ? "After this, reload the MCP (HSM quick-restart) so the Google tools work again."
+    : "No reload is needed afterwards.";
   return [
     {
       name: "google_auth_url",
@@ -148,8 +198,7 @@ export function getAuthTools(
       name: "google_auth_exchange",
       description:
         "Exchange a pasted Google OAuth authorization code (from google_auth_url) " +
-        "for tokens and save them. On success the MCP must be reloaded " +
-        "(HSM quick-restart) before the Google tools work again.",
+        `for tokens and save them. ${afterLogin}`,
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -178,7 +227,15 @@ export function getAuthTools(
           ];
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
-          throw new Error(`Code exchange failed: ${message}`);
+          return [
+            {
+              type: "text" as const,
+              text: JSON.stringify({
+                status: "error",
+                message: `Code exchange failed: ${message}`,
+              }),
+            },
+          ];
         }
       },
     },
