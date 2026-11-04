@@ -378,12 +378,28 @@ describe("broker requests", () => {
 
   it("tells a busy client when to retry", async () => {
     const { url } = await start({ alpha: { tools: [], authTools: [] } }, { maxRequestsPerSecond: 0 });
-    const res = await fetch(`${url}/mcp`, { method: "POST", headers: { Authorization: "Bearer alpha-secret" }, body: "{}" });
-    await fetch(`${url}/mcp`, { method: "POST", headers: { Authorization: "Bearer alpha-secret" }, body: "{}" });
-    const busy = await fetch(`${url}/mcp`, { method: "POST", headers: { Authorization: "Bearer alpha-secret" }, body: "{}" });
-    expect(res.status).toBeDefined();
-    expect(busy.status).toBe(429);
-    expect(busy.headers.get("retry-after")).toBe("1");
+    // Sent together, so at least two land in one second even across a boundary.
+    const all = await Promise.all(
+      Array.from({ length: 6 }, () =>
+        fetch(`${url}/mcp`, { method: "POST", headers: { Authorization: "Bearer alpha-secret" }, body: "{}" }),
+      ),
+    );
+    const busy = all.filter((r) => r.status === 429);
+    expect(busy.length).toBeGreaterThan(0);
+    for (const r of busy) expect(r.headers.get("retry-after")).toBe("1");
+  });
+
+  it.each([1, 8])("delivers a refusal even with an unread %i MB body", async (mb) => {
+    const { url } = await start({ alpha: { tools: [], authTools: [] } }, { maxRequestsPerSecond: 0 });
+    const body = Buffer.alloc(mb * 1024 * 1024, "x");
+    const statuses = await Promise.all(
+      Array.from({ length: 6 }, () =>
+        fetch(`${url}/mcp`, { method: "POST", headers: { Authorization: "Bearer alpha-secret" }, body }).then((r) => r.status),
+      ),
+    );
+    expect(statuses.filter((s) => s === 429).length).toBeGreaterThan(0);
+    const denied = await fetch(`${url}/mcp`, { method: "POST", headers: { Authorization: "Bearer wrong" }, body });
+    expect(denied.status).toBe(401);
   });
 
   it("keeps working if the full audit log was deleted", async () => {
@@ -633,9 +649,22 @@ describe("cleanErrorText", () => {
     ["jwt eyJhbGciOiJSUzI1.eyJpc3MiOiJh.c2ln", "eyJhbGci"],
     ['{"client_secret":"s3cret"}', "s3cret"],
     ['"refresh_token": "1//r3fresh"', "r3fresh"],
-    ["Create /Users/juni/.nimbleco-google/config.json first", "/Users/juni"],
+    ["Create /Users/someone/.config/config.json first", "/Users/someone"],
+    ["BASIC dXNlcjpwYXNz", "dXNlcjpwYXNz"],
+    ["cut off jwt eyJhbGciOiJSUzI1.eyJpc3MiOiJh", "eyJhbGci"],
   ])("removes the secret from %s", (input, secret) => {
     expect(cleanErrorText(input)).not.toContain(secret);
+  });
+  it.each([
+    ["eyJ-", 8_000_000],
+    ["Basic ", 5_000_000],
+    ["code:\"", 4_000_000],
+    ["/a", 16_000_000],
+    ["-----BEGIN", 3_000_000],
+  ])("stays fast on a 32 MB run of %s", (unit, times) => {
+    const started = Date.now();
+    cleanErrorText(unit.repeat(times));
+    expect(Date.now() - started).toBeLessThan(500);
   });
   it("keeps Drive IDs, and caps length", () => {
     expect(cleanErrorText("File not found: 1UyHc-d_w.")).toContain("1UyHc-d_w");

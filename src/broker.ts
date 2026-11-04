@@ -260,14 +260,18 @@ function serviceAccountError(err: unknown): ToolErrorPayload {
 
 const SECRET_KEY = /^(client_?secret|refresh_?token|access_?token|id_?token|private_?key|assertion)$/i;
 
+/** Agents can put long text in an error, so never run the patterns on all of it. */
+const MAX_CLEANED_INPUT = 16_000;
+
 function cleanString(text: string): string {
   return text
+    .slice(0, MAX_CLEANED_INPUT)
     .replace(/-----BEGIN[\s\S]*?(-----END[^-]*-----|$)/g, "<redacted>")
     .replace(/\bBearer\s+\S+/gi, "Bearer <redacted>")
-    .replace(/\b[Bb]asic\s+(?=[\w+/=-]*[0-9+/=A-Z])[\w+/=-]{8,}/g, "Basic <redacted>")
+    .replace(/\b(?:[Bb]asic|BASIC)\s+(?=[\w+/=-]*[0-9+/=A-Z])[\w+/=-]{8,}/g, "Basic <redacted>")
     .replace(/\b(ya29\.|GOCSPX-)[\w./-]+/g, "<redacted>")
     .replace(/\b(1\/\/|4\/[01])[\w./-]{10,}/g, "<redacted>")
-    .replace(/\beyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]*/g, "<redacted>")
+    .replace(/\beyJ[\w-]{8,}(?:\.[\w-]*)*/g, "<redacted>")
     .replace(
       /"?\b(client_?secret|refresh_?token|access_?token|id_?token|private_?key|assertion|code)\b"?\s*(=\s*[^\s",&}]+|:\s*"[^"]*"|:\s*'[^']*'|:\s*[^\s",}]{16,})/gi,
       "$1: <redacted>",
@@ -357,13 +361,28 @@ function readBody(req: IncomingMessage, limit: number): Promise<Buffer> {
   });
 }
 
+/** How long a client gets to finish sending a body we won't read. */
+const REPLY_LINGER_MS = 1000;
+
 function reply(res: ServerResponse, status: number, body: unknown): void {
-  // Close afterwards, or an unread body can hold the connection open.
-  const headers: Record<string, string> = { "Content-Type": "application/json", Connection: "close" };
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (status === 429) headers["Retry-After"] = "1";
   res.writeHead(status, headers);
   const socket = res.socket;
-  res.end(JSON.stringify(body), () => socket?.destroy());
+  const req = res.req;
+  res.end(JSON.stringify(body), () => {
+    if (!socket || socket.destroyed) return;
+    if (req.complete) {
+      socket.destroySoon();
+      return;
+    }
+    // Closing on unread data resets the connection and loses this reply. So
+    // discard the rest of the body, but only for a short time.
+    const timer = setTimeout(() => socket.destroy(), REPLY_LINGER_MS);
+    socket.once("close", () => clearTimeout(timer));
+    req.once("end", () => socket.destroySoon());
+    req.resume();
+  });
 }
 
 export interface BrokerOptions {
@@ -604,9 +623,7 @@ export function createBroker(config: BrokerConfig, options: BrokerOptions = {}):
         if (err instanceof BodyTooLarge) {
           // Don't keep reading, or holding memory for, a body we've refused.
           auditLimited(`big:${agent.name}`, { event: "refused", agent: agent.name, status: 413 });
-          res.writeHead(413, { "Content-Type": "application/json", Connection: "close" });
-          res.end(JSON.stringify({ error: "body too large" }), () => req.socket.destroy());
-          return;
+          return reply(res, 413, { error: "body too large" });
         }
         auditLimited(`bad:${agent.name}`, { event: "refused", agent: agent.name, status: 400 });
         return reply(res, 400, { error: "invalid JSON" });
