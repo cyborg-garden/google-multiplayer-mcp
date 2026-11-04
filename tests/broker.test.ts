@@ -367,6 +367,7 @@ describe("broker requests", () => {
         const socket = connectSocket(Number(port), "127.0.0.1", () => {
           socket.write(`POST ${path} HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n`);
         });
+        socket.resume();
         socket.on("close", () => done(true));
         socket.on("error", () => {});
         setTimeout(() => done(false), 1500);
