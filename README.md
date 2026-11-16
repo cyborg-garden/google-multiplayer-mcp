@@ -176,7 +176,8 @@ Read-only, the agent can read its downloads but can't rename the folder, plant l
 - The file is named `<file-id>-<hash>-<name>`, where the hash is of the exact id, so ids that differ only by case don't collide on a case-insensitive disk. Path separators and control characters are replaced, leading dots removed, and the name capped at 150 bytes. Downloading the same file again replaces the earlier copy.
 - The temporary file is created before anything is requested from Drive, with `O_CREAT | O_EXCL | O_NOFOLLOW`. The open file is then matched by device and inode against the entry in the configured folder, and the folder against the one checked at the start, before the download, before the rename and after it. If anything has moved, the call fails.
 - A failed, oversized, over-quota or timed-out download leaves nothing behind, and an earlier copy stays.
-- Sizes are checked before downloading and counted while streaming, since Drive's stated size can be missing. The quota counts files already in the folder plus downloads still running.
+- Sizes are checked before downloading and counted while streaming. A download may write exactly Drive's stated size, and is stopped if more arrives; with no stated size, it reserves the whole remaining per-file allowance. The quota and the free-space floor count files already in the folder plus what running downloads have reserved.
+- Partial files over an hour old, left by a broker crash, are removed at broker start and before each quota check.
 - A download is refused if it would leave less than `min_free_bytes` free on the disk.
 - Google Docs, Sheets and Slides have no file to download, so they are refused with a pointer to `drive_get`, `docs_get` and `sheets_get`.
 - Errors never show host paths; file-system errors are reported by code only.

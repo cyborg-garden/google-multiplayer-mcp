@@ -7,7 +7,7 @@ import { createHash } from "crypto";
 import { PassThrough, Readable } from "stream";
 import {
   existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync,
-  statSync, symlinkSync, writeFileSync,
+  statSync, symlinkSync, utimesSync, writeFileSync,
 } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
@@ -21,6 +21,8 @@ const hooks = vi.hoisted(() => ({}) as {
   beforeRename?: Hook;
   afterRename?: Hook;
   fail?: (fn: string, path: string) => void;
+  /** Free bytes the disk reports, in place of the real figure. */
+  freeBytes?: number;
   renames: string[];
 });
 
@@ -52,7 +54,10 @@ vi.mock("fs", async (importOriginal) => {
     fstatSync: failing("fstatSync", real.fstatSync),
     realpathSync: failing("realpathSync", real.realpathSync),
     readdirSync: failing("readdirSync", real.readdirSync),
-    statfsSync: failing("statfsSync", real.statfsSync),
+    statfsSync: failing("statfsSync", ((...a: any[]) => {
+      const st = (real.statfsSync as any)(...a);
+      return hooks.freeBytes === undefined ? st : { ...st, bavail: hooks.freeBytes, bsize: 1 };
+    }) as typeof real.statfsSync),
   };
   return { ...wrapped, default: wrapped };
 });
@@ -72,13 +77,13 @@ vi.mock("googleapis", () => {
 
 const { _mocks } = (await import("googleapis")) as any;
 const { getDriveTools } = await import("../../src/services/drive.js");
-const { safeFileName } = await import("../../src/services/drive-download.js");
+const { safeFileName, sweepStaleParts } = await import("../../src/services/drive-download.js");
 
 let root: string;
 let hostDir: string;
 beforeEach(() => {
   vi.clearAllMocks();
-  for (const k of ["beforeOpen", "afterOpen", "beforeRename", "afterRename", "fail"] as const) delete hooks[k];
+  for (const k of ["beforeOpen", "afterOpen", "beforeRename", "afterRename", "fail", "freeBytes"] as const) delete hooks[k];
   hooks.renames = [];
   root = realpathSync(mkdtempSync(join(tmpdir(), "drive-dl-")));
   hostDir = join(root, "downloads");
@@ -383,7 +388,11 @@ describe("drive_download_to_file folder races", () => {
     const other = otherFolder();
     hooks.afterRename = () => swapForLink(other);
     serve({ size: "11" });
-    await expect(tool().handler({ fileId: "file1" })).rejects.toThrow(/download folder/i);
+    const err = await tool().handler({ fileId: "file1" }).catch((e: Error) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toMatch(/download folder/i);
+    // The file is already in place, so the caller isn't told nothing was kept.
+    expect((err as Error).message).not.toMatch(/nothing was kept/);
   });
 
   it("never shows a host path in a file-system error", async () => {
@@ -424,6 +433,68 @@ describe("drive_download_to_file disk limits", () => {
     await expect(tool(cfg).handler({ fileId: "file1" })).rejects.toThrow(/quota/);
     first.end(Buffer.alloc(15));
     await running;
+  });
+
+  it("stops a download that sends more than Drive's stated size", async () => {
+    // The stated size is what was reserved, so more bytes would overshoot the quota.
+    serve({ size: "10", body: () => Readable.from([Buffer.alloc(90)]) });
+    await expect(tool().handler({ fileId: "file1" })).rejects.toThrow(/stated size/);
+    expect(files()).toEqual([]);
+  });
+
+  it("reserves the whole per-file cap for a download with no stated size", async () => {
+    const first = new PassThrough();
+    serve({ id: "nosize", size: undefined, body: () => first });
+    const cfg = config({ maxBytes: 1024, maxTotalBytes: 1030 });
+    const running = tool(cfg).handler({ fileId: "nosize" });
+    await vi.waitFor(() => expect(mediaCalls()).toBe(1));
+    serve({ size: "11" });
+    await expect(tool(cfg).handler({ fileId: "file1" })).rejects.toThrow(/quota/);
+    first.end(Buffer.alloc(5));
+    await running;
+  });
+
+  it("counts downloads still running against the free-space floor", async () => {
+    hooks.freeBytes = 100;
+    const first = new PassThrough();
+    serve({ id: "big", size: "40", body: () => first });
+    const cfg = config({ minFreeBytes: 50 });
+    const running = tool(cfg).handler({ fileId: "big" });
+    await vi.waitFor(() => expect(mediaCalls()).toBe(1));
+    serve({ size: "40" });
+    await expect(tool(cfg).handler({ fileId: "file1" })).rejects.toThrow(/disk/i);
+    first.end(Buffer.alloc(40));
+    await running;
+  });
+
+  it("clears stale partial files left by a crash before checking the quota", async () => {
+    const stale = join(hostDir, ".old.abcdef.part");
+    writeFileSync(stale, Buffer.alloc(15));
+    const hourAgo = new Date(Date.now() - 2 * 3600_000);
+    utimesSync(stale, hourAgo, hourAgo);
+    serve({ size: "11" });
+    await expect(tool(config({ maxTotalBytes: 20 })).handler({ fileId: "file1" })).resolves.toBeTruthy();
+    expect(existsSync(stale)).toBe(false);
+  });
+
+  it("keeps a recent partial file and counts it", async () => {
+    const fresh = join(hostDir, ".new.abcdef.part");
+    writeFileSync(fresh, Buffer.alloc(15));
+    serve({ size: "11" });
+    await expect(tool(config({ maxTotalBytes: 20 })).handler({ fileId: "file1" })).rejects.toThrow(/quota/);
+    expect(existsSync(fresh)).toBe(true);
+  });
+
+  it("sweeps stale partial files on demand, and nothing else", () => {
+    const stale = join(hostDir, ".old.abcdef.part");
+    const other = join(hostDir, "old-download");
+    for (const f of [stale, other]) {
+      writeFileSync(f, "x");
+      const hourAgo = new Date(Date.now() - 2 * 3600_000);
+      utimesSync(f, hourAgo, hourAgo);
+    }
+    sweepStaleParts(hostDir);
+    expect(files()).toEqual(["old-download"]);
   });
 
   it("lets a re-download replace its earlier copy within the quota", async () => {

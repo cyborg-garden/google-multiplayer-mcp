@@ -133,12 +133,43 @@ interface Activity {
 /** Downloads running now, per download folder. */
 const activity = new Map<string, Activity>();
 
+/** Our temporary files: `.<id>.<hex>.part`. */
+const PART_FILE = /^\.[A-Za-z0-9_-]+\.[0-9a-f]+\.part$/;
+/** Far longer than any download may run, so an older partial file is left from a crash. */
+const STALE_PART_MS = 60 * 60 * 1000;
+
+function isStalePart(name: string, stat: Stats, now: number): boolean {
+  return PART_FILE.test(name) && stat.isFile() && now - stat.mtimeMs > STALE_PART_MS;
+}
+
+/**
+ * Remove partial files a crashed broker left behind. A caller with a
+ * read-only mount can't remove them, and they count against its quota.
+ */
+export function sweepStaleParts(folder: string, skip: ReadonlySet<string> | Map<string, number> = new Set()): void {
+  const now = Date.now();
+  for (const entry of readdirSync(folder, { withFileTypes: true })) {
+    if (!entry.isFile() || skip.has(entry.name)) continue;
+    const path = join(folder, entry.name);
+    try {
+      if (isStalePart(entry.name, lstatSync(path), now)) unlinkSync(path);
+    } catch {
+      // Gone already, or not ours to remove.
+    }
+  }
+}
+
 /** Bytes in regular files directly in the folder, leaving out running downloads. */
 function folderUsage(folder: string, running: Activity): number {
+  sweepStaleParts(folder, running.reserved);
   let total = 0;
   for (const entry of readdirSync(folder, { withFileTypes: true })) {
     if (!entry.isFile() || running.reserved.has(entry.name)) continue;
-    total += lstatSync(join(folder, entry.name)).size;
+    try {
+      total += lstatSync(join(folder, entry.name)).size;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    }
   }
   return total;
 }
@@ -200,6 +231,8 @@ export async function writeDownload(
       `This would take the download folder over its ${formatLimit(dir.maxTotalBytes)} quota; remove old downloads first.`,
     );
     if (limit <= 0 || (statedSize !== undefined && statedSize > limit)) throw overQuota;
+    // What's reserved is exactly what may be written: Drive's stated size,
+    // or the whole remaining allowance when it states none.
     const reserve = statedSize ?? limit;
     const disk = statfsSync(folder.path);
     if (Number(disk.bavail) * Number(disk.bsize) - others - reserve < dir.minFreeBytes) {
@@ -218,7 +251,8 @@ export async function writeDownload(
     const count = new Transform({
       transform(chunk: Buffer, _encoding, done) {
         written += chunk.length;
-        if (written <= limit) return done(null, chunk);
+        if (written <= reserve) return done(null, chunk);
+        if (statedSize !== undefined) return done(new Refused(`Drive sent more than the file's stated size, so ${NOT_KEPT}.`));
         done(limit < dir.maxBytes ? overQuota : new Refused(`File is over the ${formatLimit(dir.maxBytes)} download limit`));
       },
     });
@@ -229,7 +263,14 @@ export async function writeDownload(
     verifyEntry(dir, folder, tempName, opened);
     renameSync(temp, target);
     ownTemp = false;
-    verifyEntry(dir, folder, fileName, opened);
+    try {
+      verifyEntry(dir, folder, fileName, opened);
+    } catch {
+      // The file was moved into place, so don't claim nothing was kept.
+      throw new Refused(
+        "The download folder changed as the file was moved into place. The file may be in the folder, but it couldn't be confirmed; check before using it.",
+      );
+    }
   } catch (err) {
     body?.destroy();
     if (fd !== undefined) {

@@ -27,6 +27,7 @@ import {
   DEFAULT_DOWNLOAD_MAX_CONCURRENT,
   DEFAULT_DOWNLOAD_MAX_TOTAL_BYTES,
   DEFAULT_DOWNLOAD_MIN_FREE_BYTES,
+  sweepStaleParts,
 } from "./services/drive-download.js";
 import type { DownloadDir, PermissionConfig, ServiceName, ServicePermission, ToolDef } from "./types.js";
 
@@ -723,6 +724,10 @@ export async function startBroker(configPath: string): Promise<void> {
     if (agent.credential.type === "service_account") {
       createServiceAccountClient(agent.credential.keyFile, []);
     }
+  }
+  // Partial files from a crash would count against each agent's quota.
+  for (const agent of config.agents) {
+    if (agent.downloadDir) sweepStaleParts(agent.downloadDir.hostDir);
   }
   // Refuse to start with no audit log, rather than run unrecorded.
   appendFileSync(config.auditLog, "", { mode: 0o600 });
