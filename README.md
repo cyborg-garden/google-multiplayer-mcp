@@ -98,6 +98,8 @@ agents:
   research:
     secret_sha256: <sha256 of the agent's secret, as hex>
     credential: {type: service_account, key_file: keys/research.json}
+    # Optional: lets this agent save large Drive files to disk. See below.
+    download_dir: {host: /srv/agents/research/downloads/drive, caller: /data/downloads/drive}
     permissions:
       drive: {access: write, folders: [<folder-id>]}
       docs: {access: write, folders: [<folder-id>]}
@@ -125,9 +127,10 @@ Connect an agent over MCP's streamable HTTP transport, at `/mcp` with the header
 - `folders` must be a list of IDs.
 - An OAuth agent must name each service with no folder limit in `allow_whole_account`. Gmail always needs this, because folders can't limit Gmail.
 - Listening beyond loopback needs `allow_non_loopback: true`.
+- A `download_dir` host folder must exist, be given as its real path (no links), and belong to one agent only.
 - The audit log must be writable.
 
-**Limits:** 8 requests at once per agent and 32 in total, counted until the work ends even if the client disconnects, up to the four-minute limit per tool call. Also 50 requests a second per agent, one JSON-RPC message per request, a 32 MB request body by default, a 32 MB Drive download, 2,048 connections, and a two-minute timeout per Google request with no retries. An agent should retry a call that Google refuses for being busy.
+**Limits:** 8 requests at once per agent and 32 in total, counted until the work ends even if the client disconnects, up to the four-minute limit per tool call. Also 50 requests a second per agent, one JSON-RPC message per request, a 32 MB request body by default, a 32 MB Drive download (2 GB by default with `drive_download_to_file`), 2,048 connections, and a two-minute timeout per Google request with no retries. An agent should retry a call that Google refuses for being busy.
 
 **Audit log:** one JSON line when a call starts, and one when it ends, with the agent, tool, result, time taken and IDs such as `fileId`. Recipients are recorded as email addresses only. It never records content, names or secrets. At 64 MB it moves to `audit.jsonl.1`, replacing any older one. If the log can't be written, the call isn't run. Refused requests are logged as `denied` or `refused`.
 
@@ -138,3 +141,32 @@ Connect an agent over MCP's streamable HTTP transport, at `/mcp` with the header
 - Secrets travel unencrypted, so agents sharing a network must not hold `NET_RAW`. With it, one agent could read another's secret.
 
 Calls are stateless, so restarting the broker doesn't disturb connected agents.
+
+### Large Drive files: `drive_download_to_file`
+
+`drive_download` returns the file as base64 in the tool result, so it stops at 32 MB. `drive_download_to_file` streams the file to disk instead and returns only:
+
+```json
+{"path": "/data/downloads/drive/<file-id>-clip.mp4", "name": "clip.mp4", "mimeType": "video/mp4", "size": 734003200}
+```
+
+It takes one argument, `fileId`. The folder comes only from the agent's `download_dir`; an agent without one isn't offered the tool.
+
+```yaml
+    download_dir:
+      host: /srv/agents/research/downloads/drive   # the folder as the broker sees it
+      caller: /data/downloads/drive                # the same folder as the agent sees it
+      max_bytes: 2147483648                        # optional; 2 GB by default
+```
+
+For an agent in a container, point `host` at a folder inside a directory the container already mounts, and `caller` at the same folder's path inside the container. No new mount is needed.
+
+- Same folder allowlist as `drive_download`.
+- The file is named `<file-id>-<name>`, with path separators and control characters replaced, leading dots removed, and the name capped at 150 bytes. Downloading the same file again replaces the earlier copy.
+- It is written to a temporary file and renamed when complete. A failed, oversized or timed-out download leaves nothing behind, and an earlier copy stays.
+- The size is checked against `max_bytes` before downloading and counted while streaming, since Drive's stated size can be missing.
+- Google Docs, Sheets and Slides have no file to download, so they are refused with a pointer to `drive_get`, `docs_get` and `sheets_get`.
+- The agent can often write into its own folder, so the broker refuses to write if the folder has been removed or replaced by a link, and never writes through a link.
+- A download must finish within about 3.5 minutes, under the broker's four-minute limit per call. At 2 GB that needs roughly 80 Mbit/s.
+- Free disk space isn't checked; a full disk fails the call and removes the partial file.
+- Downloads are never deleted by the broker; clear the folder yourself when needed.
