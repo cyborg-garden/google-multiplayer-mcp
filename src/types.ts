@@ -23,9 +23,31 @@ export interface ServicePermission {
   folders?: string[];
 }
 
+/**
+ * Where drive_download_to_file writes, set only by the operator. The same
+ * folder is seen at `hostDir` by this process and at `callerDir` by the agent,
+ * for example through a container mount.
+ */
+export interface DownloadDir {
+  /** Absolute path with no links in it, as this process sees it. */
+  hostDir: string;
+  /** Absolute path the caller sees; returned in tool results. */
+  callerDir: string;
+  /** Largest file the tool will write. */
+  maxBytes: number;
+  /** Most the folder may hold, counting downloads still running. */
+  maxTotalBytes: number;
+  /** Most downloads running at once into this folder. */
+  maxConcurrent: number;
+  /** A download is refused if the disk would have less free than this. */
+  minFreeBytes: number;
+}
+
 export interface PermissionConfig {
   identity: string;
   permissions: Partial<Record<ServiceName, ServicePermission>>;
+  /** Unset means drive_download_to_file isn't offered. */
+  downloadDir?: DownloadDir;
 }
 
 /** Root shape of the YAML config file. */

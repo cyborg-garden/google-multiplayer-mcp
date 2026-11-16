@@ -9,7 +9,7 @@
 import { createHash, timingSafeEqual } from "crypto";
 import { appendFileSync, existsSync, readFileSync, realpathSync, renameSync, statSync } from "fs";
 import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from "http";
-import { dirname, isAbsolute, resolve } from "path";
+import { dirname, isAbsolute, posix, resolve, sep } from "path";
 import yaml from "js-yaml";
 import { google } from "googleapis";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -22,7 +22,14 @@ import {
 import { createAuthClient, createServiceAccountClient, isAccount } from "./auth.js";
 import { formatToolError, type ToolErrorPayload } from "./auth-errors.js";
 import { collectTools, dispatchToolCall, getAuthTools, type AuthToolDef } from "./server.js";
-import type { PermissionConfig, ServiceName, ServicePermission, ToolDef } from "./types.js";
+import {
+  DEFAULT_DOWNLOAD_MAX_BYTES,
+  DEFAULT_DOWNLOAD_MAX_CONCURRENT,
+  DEFAULT_DOWNLOAD_MAX_TOTAL_BYTES,
+  DEFAULT_DOWNLOAD_MIN_FREE_BYTES,
+  sweepStaleParts,
+} from "./services/drive-download.js";
+import type { DownloadDir, PermissionConfig, ServiceName, ServicePermission, ToolDef } from "./types.js";
 
 const DEFAULT_PORT = 8797;
 const DEFAULT_MAX_BODY_BYTES = 32 * 1024 * 1024;
@@ -62,6 +69,8 @@ export interface BrokerAgent {
   secretSha256: string;
   credential: ServiceAccountCredential | OAuthCredential;
   permissions: Partial<Record<ServiceName, ServicePermission>>;
+  /** Where drive_download_to_file writes. Unset means the tool isn't offered. */
+  downloadDir?: DownloadDir;
 }
 
 export interface BrokerConfig {
@@ -104,6 +113,46 @@ function parsePermissions(agent: string, raw: unknown): BrokerAgent["permissions
   return out;
 }
 
+const DOWNLOAD_DIR_KEYS = new Set(["host", "caller", "max_bytes", "max_total_bytes", "max_concurrent", "min_free_bytes"]);
+
+/** `download_dir: {host, caller, max_bytes}`: the same folder as the broker and the agent see it. */
+function parseDownloadDir(agent: string, raw: unknown): DownloadDir | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  const bad = (why: string): never => fail(`agent "${agent}" download_dir ${why}`);
+  if (typeof raw !== "object" || Array.isArray(raw)) bad("must be {host: <path>, caller: <path>}");
+  const d = raw as Record<string, unknown>;
+  const unknown = Object.keys(d).filter((k) => !DOWNLOAD_DIR_KEYS.has(k));
+  if (unknown.length > 0) bad(`has unknown keys: ${unknown.join(", ")}`);
+  const { host, caller } = d;
+  if (typeof host !== "string" || !isAbsolute(host)) bad("needs host as an absolute path");
+  if (typeof caller !== "string" || !posix.isAbsolute(caller) || caller.split("/").includes("..")) {
+    bad("needs caller as an absolute path with no ..");
+  }
+  const hostPath = resolve(host as string);
+  let real: string;
+  try {
+    real = realpathSync(hostPath);
+  } catch {
+    return bad("host folder is missing; create it first");
+  }
+  // The agent can usually write near this folder, so a link could point the broker anywhere.
+  if (real !== hostPath) bad(`host path goes through a link; use the real path, ${real}`);
+  if (!statSync(real).isDirectory()) bad("host is not a folder");
+  const whole = (key: string, fallback: number, min: number): number => {
+    const value = d[key] ?? fallback;
+    if (!Number.isSafeInteger(value) || (value as number) < min) bad(`${key} must be a whole number, at least ${min}`);
+    return value as number;
+  };
+  return {
+    hostDir: real,
+    callerDir: posix.normalize(caller as string),
+    maxBytes: whole("max_bytes", DEFAULT_DOWNLOAD_MAX_BYTES, 1),
+    maxTotalBytes: whole("max_total_bytes", DEFAULT_DOWNLOAD_MAX_TOTAL_BYTES, 1),
+    maxConcurrent: whole("max_concurrent", DEFAULT_DOWNLOAD_MAX_CONCURRENT, 1),
+    minFreeBytes: whole("min_free_bytes", DEFAULT_DOWNLOAD_MIN_FREE_BYTES, 0),
+  };
+}
+
 /** Parse and validate broker YAML. Anything risky stops startup. */
 export function parseBrokerConfig(yamlStr: string, baseDir: string): BrokerConfig {
   const raw = yaml.load(yamlStr) as Record<string, any> | null;
@@ -113,6 +162,7 @@ export function parseBrokerConfig(yamlStr: string, baseDir: string): BrokerConfi
   const inBase = (p: string) => (isAbsolute(p) ? p : resolve(baseDir, p));
   const seen = new Set<string>();
   const seenCredentials = new Set<string>();
+  const seenDownloadDirs = new Set<string>();
   const once = (agent: string, credential: string) => {
     if (seenCredentials.has(credential)) fail(`agent "${agent}" shares another agent's credential`);
     seenCredentials.add(credential);
@@ -124,6 +174,18 @@ export function parseBrokerConfig(yamlStr: string, baseDir: string): BrokerConfi
     seen.add(secretSha256);
 
     const permissions = parsePermissions(name, a.permissions);
+    const downloadDir = parseDownloadDir(name, a.download_dir);
+    if (downloadDir) {
+      // Agents sharing a folder, or one inside another's, could read or replace each other's downloads.
+      const within = (a: string, b: string) => a === b || a.startsWith(b.endsWith(sep) ? b : b + sep);
+      for (const other of seenDownloadDirs) {
+        if (within(downloadDir.hostDir, other) || within(other, downloadDir.hostDir)) {
+          fail(`agent "${name}" download_dir shares or overlaps another agent's`);
+        }
+      }
+      seenDownloadDirs.add(downloadDir.hostDir);
+    }
+    const extra = downloadDir ? { downloadDir } : {};
     const open = (Object.entries(permissions) as [ServiceName, ServicePermission][])
       .filter(([, p]) => p.access !== "none" && (p.folders ?? []).length === 0)
       .map(([s]) => s);
@@ -142,7 +204,7 @@ export function parseBrokerConfig(yamlStr: string, baseDir: string): BrokerConfi
       }
       if (mode & 0o077) fail(`agent "${name}" key file must not be readable by group or others`);
       once(name, `key:${realpathSync(keyFile)}`);
-      return { name, secretSha256, credential: { type, keyFile }, permissions };
+      return { name, secretSha256, credential: { type, keyFile }, permissions, ...extra };
     }
 
     if (type === "oauth") {
@@ -164,7 +226,7 @@ export function parseBrokerConfig(yamlStr: string, baseDir: string): BrokerConfi
       if (unasked.length > 0) {
         fail(`agent "${name}" has no folders for ${unasked.join(", ")}; list them or add to allow_whole_account`);
       }
-      return { name, secretSha256, credential: { type, identity, expectedAccount }, permissions };
+      return { name, secretSha256, credential: { type, identity, expectedAccount }, permissions, ...extra };
     }
 
     fail(`agent "${name}" has unknown credential type "${String(type)}"`);
@@ -227,6 +289,7 @@ export function buildAgentTools(agent: BrokerAgent): AgentTools {
   const config: PermissionConfig = {
     identity: agent.credential.type === "oauth" ? agent.credential.identity : agent.name,
     permissions: agent.permissions,
+    ...(agent.downloadDir ? { downloadDir: agent.downloadDir } : {}),
   };
   if (agent.credential.type === "service_account") {
     const auth = createServiceAccountClient(agent.credential.keyFile, scopesFor(agent.permissions));
@@ -661,6 +724,10 @@ export async function startBroker(configPath: string): Promise<void> {
     if (agent.credential.type === "service_account") {
       createServiceAccountClient(agent.credential.keyFile, []);
     }
+  }
+  // Partial files from a crash would count against each agent's quota.
+  for (const agent of config.agents) {
+    if (agent.downloadDir) sweepStaleParts(agent.downloadDir.hostDir);
   }
   // Refuse to start with no audit log, rather than run unrecorded.
   appendFileSync(config.auditLog, "", { mode: 0o600 });
