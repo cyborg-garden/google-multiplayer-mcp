@@ -10,6 +10,7 @@ import {
   resolveAllowedFolderTree,
   invalidateFolderTreeCache,
 } from "./folder-scope.js";
+import { DOWNLOAD_TIMEOUT_MS, DRIVE_FILE_ID, formatLimit, writeDownload } from "./drive-download.js";
 
 const MAX_DOWNLOAD_BYTES = 32 * 1024 * 1024;
 
@@ -269,6 +270,71 @@ export function getDriveTools(
       };
     },
   });
+
+  // Offered only when the operator has set a download folder for this caller.
+  const downloadDir = config.downloadDir;
+  if (downloadDir) {
+    tools.push({
+      name: "drive_download_to_file",
+      description:
+        "Save a Drive file, such as a video, to your download folder and return its path, " +
+        `name, MIME type and size. The content is not returned. Up to ${formatLimit(downloadDir.maxBytes)}. ` +
+        "Google Docs, Sheets and Slides have no file to save: read them with drive_get, docs_get or sheets_get.",
+      service: "drive",
+      requiredAccess: "read",
+      inputSchema: {
+        type: "object",
+        required: ["fileId"],
+        properties: {
+          fileId: {
+            type: "string",
+            description: "The ID of the file to save.",
+          },
+        },
+      },
+      handler: async (args) => {
+        const fileId = args.fileId;
+        if (typeof fileId !== "string" || !DRIVE_FILE_ID.test(fileId)) {
+          throw new Error("fileId must be a Drive file id");
+        }
+
+        const meta = await drive.files.get({
+          fileId,
+          fields: "id, name, mimeType, parents, size",
+          supportsAllDrives: true,
+        });
+
+        if (!(await isWithinAllowedFolders(drive, fileId, allowedFolders))) {
+          throw new Error("Item is outside allowed folders");
+        }
+
+        const mimeType = meta.data.mimeType ?? "application/octet-stream";
+        // Docs, Sheets, Slides, folders and shortcuts have no binary content.
+        if (mimeType.startsWith("application/vnd.google-apps.")) {
+          throw new Error(
+            "This is a Google Workspace item with no file to download. " +
+              "Read it as text with drive_get, or use docs_get for a Doc and sheets_get for a Sheet.",
+          );
+        }
+
+        if (Number(meta.data.size ?? 0) > downloadDir.maxBytes) {
+          throw new Error(`File is over the ${formatLimit(downloadDir.maxBytes)} download limit`);
+        }
+
+        const id = meta.data.id ?? fileId;
+        const name = meta.data.name ?? id;
+        const { path, size } = await writeDownload(downloadDir, id, name, async (signal) => {
+          const res = await drive.files.get(
+            { fileId, alt: "media", supportsAllDrives: true },
+            // Replaces the general Google timeout, which would cut off a long download.
+            { responseType: "stream", signal, timeout: DOWNLOAD_TIMEOUT_MS },
+          );
+          return res.data as unknown as Readable;
+        });
+        return { path, name, mimeType, size };
+      },
+    });
+  }
 
   // ── Write tools ─────────────────────────────────────────────────────────
 

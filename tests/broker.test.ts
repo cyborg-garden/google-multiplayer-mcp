@@ -1,7 +1,7 @@
 import http from "node:http";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createHash, generateKeyPairSync } from "crypto";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "fs";
 import type { AddressInfo } from "net";
 import type { Server as HttpServer } from "http";
 import { tmpdir } from "os";
@@ -876,6 +876,101 @@ describe("broker config", () => {
     expect(() => parseBrokerConfig(two, dir)).toThrow(/reuses/);
     const type = yml(`  a:\n    secret_sha256: ${hash("s")}\n    credential: {type: magic}\n`);
     expect(() => parseBrokerConfig(type, dir)).toThrow(/unknown credential/);
+  });
+
+  describe("download_dir", () => {
+    const withDir = (dl: string, name = "a", secret = hash("s"), keyFile = "key.json") =>
+      sa("      drive: {access: read, folders: [F1]}\n", keyFile, secret).replace(/^  a:/, `  ${name}:`) +
+      `    download_dir: ${dl}\n`;
+    const real = () => {
+      const d = join(realpathSync(dir), "dl");
+      mkdirSync(d, { recursive: true });
+      return d;
+    };
+
+    it("loads the host and caller folders, with a 2 GB default cap", () => {
+      key();
+      const host = real();
+      const c = parseBrokerConfig(yml(withDir(`{host: ${host}, caller: /opt/data/downloads/drive}`)), dir);
+      expect(c.agents[0].downloadDir).toEqual({
+        hostDir: host,
+        callerDir: "/opt/data/downloads/drive",
+        maxBytes: 2 * 1024 * 1024 * 1024,
+      });
+    });
+
+    it("takes a custom cap", () => {
+      key();
+      const c = parseBrokerConfig(yml(withDir(`{host: ${real()}, caller: /dl, max_bytes: 1000}`)), dir);
+      expect(c.agents[0].downloadDir?.maxBytes).toBe(1000);
+    });
+
+    it("leaves it unset when not configured", () => {
+      key();
+      const c = parseBrokerConfig(yml(sa("      drive: {access: read, folders: [F1]}\n")), dir);
+      expect(c.agents[0].downloadDir).toBeUndefined();
+    });
+
+    it("needs absolute host and caller paths", () => {
+      key();
+      const host = real();
+      expect(() => parseBrokerConfig(yml(withDir(`{host: dl, caller: /dl}`)), dir)).toThrow(/download_dir/);
+      expect(() => parseBrokerConfig(yml(withDir(`{host: ${host}, caller: dl}`)), dir)).toThrow(/download_dir/);
+      expect(() => parseBrokerConfig(yml(withDir(`{host: ${host}}`)), dir)).toThrow(/download_dir/);
+      expect(() => parseBrokerConfig(yml(withDir(`${host}`)), dir)).toThrow(/download_dir/);
+    });
+
+    it("refuses a caller path with .. in it", () => {
+      key();
+      expect(() => parseBrokerConfig(yml(withDir(`{host: ${real()}, caller: /opt/data/../etc}`)), dir)).toThrow(/download_dir/);
+    });
+
+    it("refuses a missing host folder", () => {
+      key();
+      const missing = join(realpathSync(dir), "nope");
+      expect(() => parseBrokerConfig(yml(withDir(`{host: ${missing}, caller: /dl}`)), dir)).toThrow(/download_dir/);
+    });
+
+    it("refuses a host folder reached through a link", () => {
+      key();
+      const link = join(realpathSync(dir), "link");
+      symlinkSync(real(), link);
+      expect(() => parseBrokerConfig(yml(withDir(`{host: ${link}, caller: /dl}`)), dir)).toThrow(/link/);
+    });
+
+    it("refuses a bad cap and unknown keys", () => {
+      key();
+      const host = real();
+      expect(() => parseBrokerConfig(yml(withDir(`{host: ${host}, caller: /dl, max_bytes: 2GB}`)), dir)).toThrow(/max_bytes/);
+      expect(() => parseBrokerConfig(yml(withDir(`{host: ${host}, caller: /dl, max_bytes: 0}`)), dir)).toThrow(/max_bytes/);
+      expect(() => parseBrokerConfig(yml(withDir(`{host: ${host}, caller: /dl, max_byte: 5}`)), dir)).toThrow(/max_byte/);
+    });
+
+    it("refuses two agents sharing a download folder", () => {
+      key();
+      const k2 = join(dir, "key2.json");
+      writeFileSync(k2, readFileSync(join(dir, "key.json")));
+      chmodSync(k2, 0o600);
+      const host = real();
+      const two = yml(
+        withDir(`{host: ${host}, caller: /dl}`) +
+        withDir(`{host: ${host}, caller: /dl}`, "b", hash("t"), "key2.json"),
+      );
+      expect(() => parseBrokerConfig(two, dir)).toThrow(/download/);
+    });
+
+    it("offers drive_download_to_file only to an agent with a download folder", () => {
+      const keyFile = key();
+      const base = {
+        name: "a",
+        secretSha256: hash("s"),
+        credential: { type: "service_account" as const, keyFile },
+        permissions: { drive: { access: "read" as const, folders: ["F1"] } },
+      };
+      expect(buildAgentTools(base).tools.map((t) => t.name)).not.toContain("drive_download_to_file");
+      const withDl = buildAgentTools({ ...base, downloadDir: { hostDir: real(), callerDir: "/dl", maxBytes: 10 } });
+      expect(withDl.tools.map((t) => t.name)).toContain("drive_download_to_file");
+    });
   });
 });
 
