@@ -9,7 +9,7 @@
 import { createHash, timingSafeEqual } from "crypto";
 import { appendFileSync, existsSync, readFileSync, realpathSync, renameSync, statSync } from "fs";
 import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from "http";
-import { dirname, isAbsolute, posix, resolve } from "path";
+import { dirname, isAbsolute, posix, resolve, sep } from "path";
 import yaml from "js-yaml";
 import { google } from "googleapis";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -22,7 +22,12 @@ import {
 import { createAuthClient, createServiceAccountClient, isAccount } from "./auth.js";
 import { formatToolError, type ToolErrorPayload } from "./auth-errors.js";
 import { collectTools, dispatchToolCall, getAuthTools, type AuthToolDef } from "./server.js";
-import { DEFAULT_DOWNLOAD_MAX_BYTES } from "./services/drive-download.js";
+import {
+  DEFAULT_DOWNLOAD_MAX_BYTES,
+  DEFAULT_DOWNLOAD_MAX_CONCURRENT,
+  DEFAULT_DOWNLOAD_MAX_TOTAL_BYTES,
+  DEFAULT_DOWNLOAD_MIN_FREE_BYTES,
+} from "./services/drive-download.js";
 import type { DownloadDir, PermissionConfig, ServiceName, ServicePermission, ToolDef } from "./types.js";
 
 const DEFAULT_PORT = 8797;
@@ -107,7 +112,7 @@ function parsePermissions(agent: string, raw: unknown): BrokerAgent["permissions
   return out;
 }
 
-const DOWNLOAD_DIR_KEYS = new Set(["host", "caller", "max_bytes"]);
+const DOWNLOAD_DIR_KEYS = new Set(["host", "caller", "max_bytes", "max_total_bytes", "max_concurrent", "min_free_bytes"]);
 
 /** `download_dir: {host, caller, max_bytes}`: the same folder as the broker and the agent see it. */
 function parseDownloadDir(agent: string, raw: unknown): DownloadDir | undefined {
@@ -132,9 +137,19 @@ function parseDownloadDir(agent: string, raw: unknown): DownloadDir | undefined 
   // The agent can usually write near this folder, so a link could point the broker anywhere.
   if (real !== hostPath) bad(`host path goes through a link; use the real path, ${real}`);
   if (!statSync(real).isDirectory()) bad("host is not a folder");
-  const maxBytes = d.max_bytes ?? DEFAULT_DOWNLOAD_MAX_BYTES;
-  if (!Number.isInteger(maxBytes) || (maxBytes as number) <= 0) bad("max_bytes must be a positive whole number of bytes");
-  return { hostDir: real, callerDir: posix.normalize(caller as string), maxBytes: maxBytes as number };
+  const whole = (key: string, fallback: number, min: number): number => {
+    const value = d[key] ?? fallback;
+    if (!Number.isSafeInteger(value) || (value as number) < min) bad(`${key} must be a whole number, at least ${min}`);
+    return value as number;
+  };
+  return {
+    hostDir: real,
+    callerDir: posix.normalize(caller as string),
+    maxBytes: whole("max_bytes", DEFAULT_DOWNLOAD_MAX_BYTES, 1),
+    maxTotalBytes: whole("max_total_bytes", DEFAULT_DOWNLOAD_MAX_TOTAL_BYTES, 1),
+    maxConcurrent: whole("max_concurrent", DEFAULT_DOWNLOAD_MAX_CONCURRENT, 1),
+    minFreeBytes: whole("min_free_bytes", DEFAULT_DOWNLOAD_MIN_FREE_BYTES, 0),
+  };
 }
 
 /** Parse and validate broker YAML. Anything risky stops startup. */
@@ -160,8 +175,13 @@ export function parseBrokerConfig(yamlStr: string, baseDir: string): BrokerConfi
     const permissions = parsePermissions(name, a.permissions);
     const downloadDir = parseDownloadDir(name, a.download_dir);
     if (downloadDir) {
-      // Agents sharing a folder could read or replace each other's downloads.
-      if (seenDownloadDirs.has(downloadDir.hostDir)) fail(`agent "${name}" shares another agent's download_dir`);
+      // Agents sharing a folder, or one inside another's, could read or replace each other's downloads.
+      const within = (a: string, b: string) => a === b || a.startsWith(b.endsWith(sep) ? b : b + sep);
+      for (const other of seenDownloadDirs) {
+        if (within(downloadDir.hostDir, other) || within(other, downloadDir.hostDir)) {
+          fail(`agent "${name}" download_dir shares or overlaps another agent's`);
+        }
+      }
       seenDownloadDirs.add(downloadDir.hostDir);
     }
     const extra = downloadDir ? { downloadDir } : {};

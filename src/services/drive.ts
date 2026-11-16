@@ -317,13 +317,10 @@ export function getDriveTools(
           );
         }
 
-        if (Number(meta.data.size ?? 0) > downloadDir.maxBytes) {
-          throw new Error(`File is over the ${formatLimit(downloadDir.maxBytes)} download limit`);
-        }
-
         const id = meta.data.id ?? fileId;
         const name = meta.data.name ?? id;
-        const { path, size } = await writeDownload(downloadDir, id, name, async (signal) => {
+        const statedSize = meta.data.size ? Number(meta.data.size) : undefined;
+        const { path, size } = await writeDownload(downloadDir, id, name, statedSize, async (signal) => {
           const res = await drive.files.get(
             { fileId, alt: "media", supportsAllDrives: true },
             // Replaces the general Google timeout, which would cut off a long download.

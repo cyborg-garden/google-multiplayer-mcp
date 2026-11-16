@@ -3,11 +3,59 @@
  * from config, and returns only the path the caller sees plus metadata.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { Readable } from "stream";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync } from "fs";
+import { createHash } from "crypto";
+import { PassThrough, Readable } from "stream";
+import {
+  existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync,
+  statSync, symlinkSync, writeFileSync,
+} from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import type { DownloadDir, PermissionConfig } from "../../src/types.js";
+
+/** Points where a test can act, as an agent racing the broker would. */
+type Hook = (path: string) => void;
+const hooks = vi.hoisted(() => ({}) as {
+  beforeOpen?: Hook;
+  afterOpen?: Hook;
+  beforeRename?: Hook;
+  afterRename?: Hook;
+  fail?: (fn: string, path: string) => void;
+  renames: string[];
+});
+
+vi.mock("fs", async (importOriginal) => {
+  const real = await importOriginal<typeof import("fs")>();
+  const failing = <T extends (...a: any[]) => any>(name: string, fn: T) =>
+    ((...a: any[]) => {
+      hooks.fail?.(name, String(a[0]));
+      return fn(...a);
+    }) as T;
+  const wrapped = {
+    ...real,
+    openSync: (...a: any[]) => {
+      hooks.beforeOpen?.(String(a[0]));
+      const fd = (real.openSync as any)(...a);
+      hooks.afterOpen?.(String(a[0]));
+      return fd;
+    },
+    renameSync: (from: any, to: any) => {
+      // Only the broker's own rename of a temporary file; tests rename folders too.
+      if (!String(from).endsWith(".part")) return real.renameSync(from, to);
+      hooks.renames.push(String(from));
+      hooks.beforeRename?.(String(from));
+      real.renameSync(from, to);
+      hooks.afterRename?.(String(to));
+    },
+    statSync: failing("statSync", real.statSync),
+    lstatSync: failing("lstatSync", real.lstatSync),
+    fstatSync: failing("fstatSync", real.fstatSync),
+    realpathSync: failing("realpathSync", real.realpathSync),
+    readdirSync: failing("readdirSync", real.readdirSync),
+    statfsSync: failing("statfsSync", real.statfsSync),
+  };
+  return { ...wrapped, default: wrapped };
+});
 
 vi.mock("googleapis", () => {
   const getFn = vi.fn();
@@ -30,6 +78,8 @@ let root: string;
 let hostDir: string;
 beforeEach(() => {
   vi.clearAllMocks();
+  for (const k of ["beforeOpen", "afterOpen", "beforeRename", "afterRename", "fail"] as const) delete hooks[k];
+  hooks.renames = [];
   root = realpathSync(mkdtempSync(join(tmpdir(), "drive-dl-")));
   hostDir = join(root, "downloads");
   mkdirSync(hostDir);
@@ -40,7 +90,15 @@ function config(overrides: Partial<DownloadDir> = {}, folders = ["folder-a"]): P
   return {
     identity: "test",
     permissions: { drive: { access: "read", folders } },
-    downloadDir: { hostDir, callerDir: "/opt/data/downloads/drive", maxBytes: 1024, ...overrides },
+    downloadDir: {
+      hostDir,
+      callerDir: "/opt/data/downloads/drive",
+      maxBytes: 1024,
+      maxTotalBytes: 1_000_000,
+      maxConcurrent: 2,
+      minFreeBytes: 0,
+      ...overrides,
+    },
   };
 }
 
@@ -79,6 +137,28 @@ function tool(cfg: PermissionConfig = config()) {
 
 const files = () => readdirSync(hostDir);
 
+/** The stored name: the id, a short hash of the exact id, then the safe name. */
+const stored = (id: string, name: string) =>
+  `${id}-${createHash("sha256").update(id).digest("hex").slice(0, 8)}-${name}`;
+const F1 = stored("file1", "clip.mp4");
+
+/** Swap the download folder for a link to `target`, keeping the real one at `aside`. */
+function swapForLink(target: string, aside = join(root, "aside")) {
+  renameSync(hostDir, aside);
+  symlinkSync(target, hostDir);
+}
+function swapBack(aside = join(root, "aside")) {
+  rmSync(hostDir);
+  renameSync(aside, hostDir);
+}
+function otherFolder() {
+  const d = join(root, "other-agent");
+  mkdirSync(d);
+  return d;
+}
+const mediaCalls = () => _mocks.getFn.mock.calls.filter((c: any[]) => c[0].alt === "media").length;
+
+
 describe("drive_download_to_file is offered only with a download folder", () => {
   it("is not offered when no download folder is configured", () => {
     const { downloadDir: _, ...noDir } = config();
@@ -102,13 +182,13 @@ describe("drive_download_to_file streaming", () => {
     serve({ size: "11" });
     const result = (await tool().handler({ fileId: "file1" })) as any;
     expect(result).toEqual({
-      path: "/opt/data/downloads/drive/file1-clip.mp4",
+      path: `/opt/data/downloads/drive/${F1}`,
       name: "clip.mp4",
       mimeType: "video/mp4",
       size: 11,
     });
-    expect(readFileSync(join(hostDir, "file1-clip.mp4"), "utf-8")).toBe("hello world");
-    expect(files()).toEqual(["file1-clip.mp4"]);
+    expect(readFileSync(join(hostDir, F1), "utf-8")).toBe("hello world");
+    expect(files()).toEqual([F1]);
   });
 
   it("does not return file content or the host path", async () => {
@@ -123,8 +203,8 @@ describe("drive_download_to_file streaming", () => {
     await tool().handler({ fileId: "file1" });
     serve({ size: "3", body: () => Readable.from([Buffer.from("new")]) });
     await tool().handler({ fileId: "file1" });
-    expect(readFileSync(join(hostDir, "file1-clip.mp4"), "utf-8")).toBe("new");
-    expect(files()).toEqual(["file1-clip.mp4"]);
+    expect(readFileSync(join(hostDir, F1), "utf-8")).toBe("new");
+    expect(files()).toEqual([F1]);
   });
 });
 
@@ -200,8 +280,8 @@ describe("drive_download_to_file safety", () => {
         }),
     });
     await expect(tool().handler({ fileId: "file1" })).rejects.toThrow();
-    expect(files()).toEqual(["file1-clip.mp4"]);
-    expect(readFileSync(join(hostDir, "file1-clip.mp4"), "utf-8")).toBe("hello world");
+    expect(files()).toEqual([F1]);
+    expect(readFileSync(join(hostDir, F1), "utf-8")).toBe("hello world");
   });
 
   it("refuses Google Docs, Sheets and Slides with a pointer to the export tools", async () => {
@@ -248,6 +328,144 @@ describe("drive_download_to_file safety", () => {
     rmSync(hostDir, { recursive: true });
     serve({ size: "11" });
     await expect(tool().handler({ fileId: "file1" })).rejects.toThrow(/download folder/i);
+  });
+});
+
+
+describe("drive_download_to_file folder races", () => {
+  it("creates the file before asking Drive, and refuses if it landed elsewhere", async () => {
+    // An agent swaps its folder for a link and back around the moment of creation.
+    const other = otherFolder();
+    hooks.beforeOpen = () => swapForLink(other);
+    hooks.afterOpen = () => swapBack();
+    serve({ size: "11" });
+    await expect(tool().handler({ fileId: "file1" })).rejects.toThrow(/download folder/i);
+    expect(mediaCalls()).toBe(0);
+    for (const f of readdirSync(other)) expect(statSync(join(other, f)).size).toBe(0);
+    expect(files()).toEqual([]);
+  });
+
+  it("refuses a link planted where the temporary file goes", async () => {
+    const other = otherFolder();
+    writeFileSync(join(other, "victim"), "keep me");
+    hooks.beforeOpen = (path) => symlinkSync(join(other, "victim"), path);
+    serve({ size: "11" });
+    await expect(tool().handler({ fileId: "file1" })).rejects.toThrow();
+    expect(mediaCalls()).toBe(0);
+    expect(readFileSync(join(other, "victim"), "utf-8")).toBe("keep me");
+  });
+
+  it("never opens a hard link planted where the temporary file goes", async () => {
+    // A hard link passes an inode check, so only O_EXCL stops this one.
+    const other = otherFolder();
+    writeFileSync(join(other, "victim"), "keep me");
+    hooks.beforeOpen = (path) => linkSync(join(other, "victim"), path);
+    serve({ size: "11" });
+    await expect(tool().handler({ fileId: "file1" })).rejects.toThrow();
+    expect(readFileSync(join(other, "victim"), "utf-8")).toBe("keep me");
+  });
+
+  it("checks the folder again before moving the file into place", async () => {
+    const other = otherFolder();
+    serve({
+      size: "11",
+      body: () => {
+        swapForLink(other);
+        return Readable.from([Buffer.from("hello world")]);
+      },
+    });
+    await expect(tool().handler({ fileId: "file1" })).rejects.toThrow(/download folder/i);
+    expect(hooks.renames).toEqual([]);
+    expect(readdirSync(other)).toEqual([]);
+  });
+
+  it("checks the folder after moving the file into place", async () => {
+    const other = otherFolder();
+    hooks.afterRename = () => swapForLink(other);
+    serve({ size: "11" });
+    await expect(tool().handler({ fileId: "file1" })).rejects.toThrow(/download folder/i);
+  });
+
+  it("never shows a host path in a file-system error", async () => {
+    for (const fn of ["statSync", "lstatSync", "fstatSync", "realpathSync", "readdirSync", "statfsSync"]) {
+      hooks.fail = (name, path) => {
+        if (name !== fn) return;
+        throw Object.assign(new Error(`EIO: i/o error, ${name} '${path}'`), { code: "EIO" });
+      };
+      serve({ size: "11" });
+      const outcome = await tool().handler({ fileId: "file1" }).catch((e: Error) => e);
+      if (outcome instanceof Error) expect(outcome.message, fn).not.toContain(root);
+    }
+  });
+});
+
+describe("drive_download_to_file disk limits", () => {
+  it("refuses when the folder's quota would be exceeded", async () => {
+    writeFileSync(join(hostDir, "old-download"), Buffer.alloc(15));
+    serve({ size: "11" });
+    await expect(tool(config({ maxTotalBytes: 20 })).handler({ fileId: "file1" })).rejects.toThrow(/quota/);
+    expect(mediaCalls()).toBe(0);
+  });
+
+  it("enforces the quota while streaming when Drive gives no size", async () => {
+    writeFileSync(join(hostDir, "old-download"), Buffer.alloc(15));
+    serve({ size: undefined });
+    await expect(tool(config({ maxTotalBytes: 20 })).handler({ fileId: "file1" })).rejects.toThrow(/quota|limit/);
+    expect(files()).toEqual(["old-download"]);
+  });
+
+  it("counts downloads still running against the quota", async () => {
+    const first = new PassThrough();
+    serve({ id: "big", size: "15", body: () => first });
+    const cfg = config({ maxTotalBytes: 20 });
+    const running = tool(cfg).handler({ fileId: "big" });
+    await vi.waitFor(() => expect(mediaCalls()).toBe(1));
+    serve({ size: "11" });
+    await expect(tool(cfg).handler({ fileId: "file1" })).rejects.toThrow(/quota/);
+    first.end(Buffer.alloc(15));
+    await running;
+  });
+
+  it("lets a re-download replace its earlier copy within the quota", async () => {
+    serve({ size: "11" });
+    const cfg = config({ maxTotalBytes: 15 });
+    await tool(cfg).handler({ fileId: "file1" });
+    await expect(tool(cfg).handler({ fileId: "file1" })).resolves.toBeTruthy();
+  });
+
+  it("limits how many downloads one caller runs at once", async () => {
+    const streams = [new PassThrough(), new PassThrough()];
+    let n = 0;
+    serve({ size: "5", body: () => streams[n++] });
+    const cfg = config({ maxConcurrent: 2 });
+    const a = tool(cfg).handler({ fileId: "file1" });
+    const b = tool(cfg).handler({ fileId: "file2" });
+    await vi.waitFor(() => expect(mediaCalls()).toBe(2));
+    await expect(tool(cfg).handler({ fileId: "file3" })).rejects.toThrow(/at once/);
+    for (const s of streams) s.end(Buffer.from("12345"));
+    await Promise.all([a, b]);
+    // A finished download frees its place.
+    serve({ size: "5", body: () => Readable.from([Buffer.from("12345")]) });
+    await expect(tool(cfg).handler({ fileId: "file3" })).resolves.toBeTruthy();
+  });
+
+  it("refuses when the disk would drop below the free-space floor", async () => {
+    serve({ size: "11" });
+    await expect(tool(config({ minFreeBytes: Number.MAX_SAFE_INTEGER })).handler({ fileId: "file1" }))
+      .rejects.toThrow(/disk/i);
+    expect(mediaCalls()).toBe(0);
+    expect(files()).toEqual([]);
+  });
+});
+
+describe("drive_download_to_file names", () => {
+  it("gives ids that differ only by case different names", async () => {
+    serve({ id: "abcDEF", size: "11" });
+    const a = (await tool().handler({ fileId: "abcDEF" })) as any;
+    serve({ id: "ABCdef", size: "11" });
+    const b = (await tool().handler({ fileId: "ABCdef" })) as any;
+    expect(a.path.toLowerCase()).not.toBe(b.path.toLowerCase());
+    expect(files()).toHaveLength(2);
   });
 });
 

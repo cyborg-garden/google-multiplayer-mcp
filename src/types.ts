@@ -35,6 +35,12 @@ export interface DownloadDir {
   callerDir: string;
   /** Largest file the tool will write. */
   maxBytes: number;
+  /** Most the folder may hold, counting downloads still running. */
+  maxTotalBytes: number;
+  /** Most downloads running at once into this folder. */
+  maxConcurrent: number;
+  /** A download is refused if the disk would have less free than this. */
+  minFreeBytes: number;
 }
 
 export interface PermissionConfig {

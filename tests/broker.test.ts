@@ -896,13 +896,54 @@ describe("broker config", () => {
         hostDir: host,
         callerDir: "/opt/data/downloads/drive",
         maxBytes: 2 * 1024 * 1024 * 1024,
+        maxTotalBytes: 10 * 1024 * 1024 * 1024,
+        maxConcurrent: 2,
+        minFreeBytes: 5 * 1024 * 1024 * 1024,
       });
     });
 
-    it("takes a custom cap", () => {
+    it("takes custom limits", () => {
       key();
-      const c = parseBrokerConfig(yml(withDir(`{host: ${real()}, caller: /dl, max_bytes: 1000}`)), dir);
-      expect(c.agents[0].downloadDir?.maxBytes).toBe(1000);
+      const c = parseBrokerConfig(
+        yml(withDir(`{host: ${real()}, caller: /dl, max_bytes: 1000, max_total_bytes: 5000, max_concurrent: 1, min_free_bytes: 0}`)),
+        dir,
+      );
+      expect(c.agents[0].downloadDir).toMatchObject({ maxBytes: 1000, maxTotalBytes: 5000, maxConcurrent: 1, minFreeBytes: 0 });
+    });
+
+    it("refuses bad quota, concurrency and free-space values", () => {
+      key();
+      const host = real();
+      const y = (extra: string) => yml(withDir(`{host: ${host}, caller: /dl, ${extra}}`));
+      expect(() => parseBrokerConfig(y("max_total_bytes: 0"), dir)).toThrow(/max_total_bytes/);
+      expect(() => parseBrokerConfig(y("max_concurrent: 0"), dir)).toThrow(/max_concurrent/);
+      expect(() => parseBrokerConfig(y("max_concurrent: 1.5"), dir)).toThrow(/max_concurrent/);
+      expect(() => parseBrokerConfig(y("min_free_bytes: -1"), dir)).toThrow(/min_free_bytes/);
+    });
+
+    it("refuses one agent's folder inside another's", () => {
+      key();
+      const k2 = join(dir, "key2.json");
+      writeFileSync(k2, readFileSync(join(dir, "key.json")));
+      chmodSync(k2, 0o600);
+      const host = real();
+      const inner = join(host, "inner");
+      mkdirSync(inner);
+      for (const [a, b] of [[host, inner], [inner, host]]) {
+        const two = yml(
+          withDir(`{host: ${a}, caller: /dl}`) +
+          withDir(`{host: ${b}, caller: /dl}`, "b", hash("t"), "key2.json"),
+        );
+        expect(() => parseBrokerConfig(two, dir)).toThrow(/download_dir/);
+      }
+      // A shared prefix that isn't a parent folder is fine.
+      const sibling = `${host}2`;
+      mkdirSync(sibling);
+      const ok = yml(
+        withDir(`{host: ${host}, caller: /dl}`) +
+        withDir(`{host: ${sibling}, caller: /dl}`, "b", hash("t"), "key2.json"),
+      );
+      expect(parseBrokerConfig(ok, dir).agents).toHaveLength(2);
     });
 
     it("leaves it unset when not configured", () => {
@@ -968,7 +1009,7 @@ describe("broker config", () => {
         permissions: { drive: { access: "read" as const, folders: ["F1"] } },
       };
       expect(buildAgentTools(base).tools.map((t) => t.name)).not.toContain("drive_download_to_file");
-      const withDl = buildAgentTools({ ...base, downloadDir: { hostDir: real(), callerDir: "/dl", maxBytes: 10 } });
+      const withDl = buildAgentTools({ ...base, downloadDir: { hostDir: real(), callerDir: "/dl", maxBytes: 10, maxTotalBytes: 10, maxConcurrent: 1, minFreeBytes: 0 } });
       expect(withDl.tools.map((t) => t.name)).toContain("drive_download_to_file");
     });
   });
