@@ -43,11 +43,34 @@ export interface DownloadDir {
   minFreeBytes: number;
 }
 
+/**
+ * A folder the caller writes and this process only reads, for
+ * drive_upload_from_file. Kept apart from the download folder, which is
+ * best mounted read-only for the caller.
+ */
+export interface UploadDir {
+  /** Absolute path with no links in it, as this process sees it. */
+  hostDir: string;
+  /** Absolute path the caller sees; named in tool descriptions and errors. */
+  callerDir: string;
+  /** Largest file the tool will send. */
+  maxBytes: number;
+  /**
+   * The folder's device and inode when the config was loaded, as decimal
+   * strings. Every upload is read from this exact directory, whatever the
+   * path points at by then.
+   */
+  dev: string;
+  ino: string;
+}
+
 export interface PermissionConfig {
   identity: string;
   permissions: Partial<Record<ServiceName, ServicePermission>>;
   /** Unset means drive_download_to_file isn't offered. */
   downloadDir?: DownloadDir;
+  /** Unset means drive_upload_from_file isn't offered. */
+  uploadDir?: UploadDir;
 }
 
 /** Root shape of the YAML config file. */

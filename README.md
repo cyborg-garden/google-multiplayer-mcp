@@ -127,6 +127,7 @@ Connect an agent over MCP's streamable HTTP transport, at `/mcp` with the header
 - `folders` must be a list of IDs.
 - An OAuth agent must name each service with no folder limit in `allow_whole_account`. Gmail always needs this, because folders can't limit Gmail.
 - Listening beyond loopback needs `allow_non_loopback: true`.
+- An `upload_dir` (for `drive_upload_from_file`) follows the same rules as `download_dir` and may not overlap one.
 - A `download_dir` host folder must exist, be given as its real path (no links), and belong to one agent only: no two agents' folders may be the same or one inside the other.
 - The audit log must be writable.
 
@@ -183,3 +184,42 @@ Read-only, the agent can read its downloads but can't rename the folder, plant l
 - Errors never show host paths; file-system errors are reported by code only.
 - A download must finish within about 3.5 minutes, under the broker's four-minute limit per call. At 2 GB that needs roughly 80 Mbit/s.
 - The broker never deletes downloads; clear the folder when the quota fills.
+
+
+### Videos, PDFs and other binary files: `drive_upload_from_file`
+
+`drive_upload` takes its content as a string in the tool call. That suits text and small files (pass binary as base64 with `encoding: base64`), but an agent can't type a video into a tool call. `drive_upload_from_file` sends a file from disk instead, byte for byte:
+
+```json
+{"path": "/data/uploads/drive/cut.mp4", "folderId": "<drive-folder-id>"}
+```
+
+`name` and `mimeType` are optional; the type is chosen from the file name. The result carries the new file's `id`, `size` and `webViewLink`. If Drive stores a different number of bytes than the file holds, the call fails and says so.
+
+The agent copies the file into its upload folder first. That folder comes only from the agent's `upload_dir`; an agent without one, or without Drive `write` access, isn't offered the tool.
+
+```yaml
+    upload_dir:
+      host: /srv/broker-uploads/research   # the folder as the broker sees it
+      caller: /data/uploads/drive          # the same folder as the agent sees it
+      max_bytes: 2147483648                # optional: largest file; 2 GB by default
+```
+
+**Setup for an agent in a container:** give each agent a host folder outside its own data folder, with parents only the operator can change, and bind-mount it read-write into the container at the `caller` path:
+
+```yaml
+# the agent's compose service
+volumes:
+  - /srv/broker-uploads/research:/data/uploads/drive
+```
+
+The agent can then fill the folder but can't rename it, delete it, or replace it or any folder above it. Don't point `host` at a folder inside the agent's own data folder: the broker learns which directory the folder is by reading its path once at startup, and an agent that can swap that path at that moment could have another folder recorded in its place.
+
+- The agent must be able to write to this folder, so it is a different folder from `download_dir`, which is best mounted read-only.
+- The host folder must exist, be given as its real path (no links), and belong to one agent only. It may not be the same as, inside, or around any `download_dir`, another agent's `upload_dir`, or the broker's own folder (where its keys are kept).
+- Only regular files directly in the folder are sent. Links, pipes, subfolders, hidden files and paths elsewhere are refused.
+- The broker records which directory the folder is when it starts, and reads every upload from that exact directory, opening the file by name from inside it. An agent that swaps its folder for a link to someone else's gets a refusal, however it times the swap. If you delete and recreate the folder, restart the broker.
+- If the file is cut short or changes size while it is read, the upload fails; nothing shorter than the file is left in Drive looking whole.
+- Two uploads at a time per agent.
+- Keep credentials out of it: anything in this folder can be sent to Drive on the agent's word. The broker refuses its own config folder, but can't know where else you keep keys.
+- Same folder allowlist as `drive_upload`.
