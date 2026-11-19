@@ -29,7 +29,8 @@ import {
   DEFAULT_DOWNLOAD_MIN_FREE_BYTES,
   sweepStaleParts,
 } from "./services/drive-download.js";
-import type { DownloadDir, PermissionConfig, ServiceName, ServicePermission, ToolDef } from "./types.js";
+import { folderIdentity } from "./services/drive-upload.js";
+import type { DownloadDir, PermissionConfig, ServiceName, ServicePermission, ToolDef, UploadDir } from "./types.js";
 
 const DEFAULT_PORT = 8797;
 const DEFAULT_MAX_BODY_BYTES = 32 * 1024 * 1024;
@@ -71,6 +72,8 @@ export interface BrokerAgent {
   permissions: Partial<Record<ServiceName, ServicePermission>>;
   /** Where drive_download_to_file writes. Unset means the tool isn't offered. */
   downloadDir?: DownloadDir;
+  /** Where drive_upload_from_file reads. Unset means the tool isn't offered. */
+  uploadDir?: UploadDir;
 }
 
 export interface BrokerConfig {
@@ -153,6 +156,36 @@ function parseDownloadDir(agent: string, raw: unknown): DownloadDir | undefined 
   };
 }
 
+const UPLOAD_DIR_KEYS = new Set(["host", "caller", "max_bytes"]);
+
+/** `upload_dir: {host, caller, max_bytes}`: a folder the agent writes and the broker only reads. */
+function parseUploadDir(agent: string, raw: unknown): UploadDir | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  const bad = (why: string): never => fail(`agent "${agent}" upload_dir ${why}`);
+  if (typeof raw !== "object" || Array.isArray(raw)) bad("must be {host: <path>, caller: <path>}");
+  const d = raw as Record<string, unknown>;
+  const unknown = Object.keys(d).filter((k) => !UPLOAD_DIR_KEYS.has(k));
+  if (unknown.length > 0) bad(`has unknown keys: ${unknown.join(", ")}`);
+  const { host, caller } = d;
+  if (typeof host !== "string" || !isAbsolute(host)) bad("needs host as an absolute path");
+  if (typeof caller !== "string" || !posix.isAbsolute(caller) || caller.split("/").includes("..")) {
+    bad("needs caller as an absolute path with no ..");
+  }
+  const hostPath = resolve(host as string);
+  let real: string;
+  try {
+    real = realpathSync(hostPath);
+  } catch {
+    return bad("host folder is missing; create it first");
+  }
+  // The agent writes here, so a link could point the broker at any file it can read.
+  if (real !== hostPath) bad(`host path goes through a link; use the real path, ${real}`);
+  if (!statSync(real).isDirectory()) bad("host is not a folder");
+  const maxBytes = d.max_bytes ?? DEFAULT_DOWNLOAD_MAX_BYTES;
+  if (!Number.isSafeInteger(maxBytes) || (maxBytes as number) < 1) bad("max_bytes must be a whole number, at least 1");
+  return { hostDir: real, callerDir: posix.normalize(caller as string), maxBytes: maxBytes as number, ...folderIdentity(real) };
+}
+
 /** Parse and validate broker YAML. Anything risky stops startup. */
 export function parseBrokerConfig(yamlStr: string, baseDir: string): BrokerConfig {
   const raw = yaml.load(yamlStr) as Record<string, any> | null;
@@ -163,6 +196,13 @@ export function parseBrokerConfig(yamlStr: string, baseDir: string): BrokerConfi
   const seen = new Set<string>();
   const seenCredentials = new Set<string>();
   const seenDownloadDirs = new Set<string>();
+  const seenUploadDirs = new Set<string>();
+  let configDir = resolve(baseDir);
+  try {
+    configDir = realpathSync(configDir);
+  } catch {
+    // A missing folder holds no keys to protect.
+  }
   const once = (agent: string, credential: string) => {
     if (seenCredentials.has(credential)) fail(`agent "${agent}" shares another agent's credential`);
     seenCredentials.add(credential);
@@ -175,17 +215,35 @@ export function parseBrokerConfig(yamlStr: string, baseDir: string): BrokerConfi
 
     const permissions = parsePermissions(name, a.permissions);
     const downloadDir = parseDownloadDir(name, a.download_dir);
+    // Compared without case: on a case-insensitive disk, two spellings are one folder.
+    const within = (x: string, y: string) => {
+      const [a, b] = [x.toLowerCase(), y.toLowerCase()];
+      return a === b || a.startsWith(b.endsWith(sep) ? b : b + sep);
+    };
     if (downloadDir) {
       // Agents sharing a folder, or one inside another's, could read or replace each other's downloads.
-      const within = (a: string, b: string) => a === b || a.startsWith(b.endsWith(sep) ? b : b + sep);
-      for (const other of seenDownloadDirs) {
+      for (const other of [...seenDownloadDirs, ...seenUploadDirs]) {
         if (within(downloadDir.hostDir, other) || within(other, downloadDir.hostDir)) {
           fail(`agent "${name}" download_dir shares or overlaps another agent's`);
         }
       }
       seenDownloadDirs.add(downloadDir.hostDir);
     }
-    const extra = downloadDir ? { downloadDir } : {};
+    const uploadDir = parseUploadDir(name, a.upload_dir);
+    if (uploadDir) {
+      // An upload folder is read on the agent's word, so it must hold that agent's files only.
+      for (const other of [...seenDownloadDirs, ...seenUploadDirs]) {
+        if (within(uploadDir.hostDir, other) || within(other, uploadDir.hostDir)) {
+          fail(`agent "${name}" upload_dir shares or overlaps a download_dir or another agent's upload_dir`);
+        }
+      }
+      // Whatever sits in this folder can be sent to Drive on the agent's word.
+      if (within(uploadDir.hostDir, configDir) || within(configDir, uploadDir.hostDir)) {
+        fail(`agent "${name}" upload_dir shares or overlaps the broker's own folder, where its keys are kept`);
+      }
+      seenUploadDirs.add(uploadDir.hostDir);
+    }
+    const extra = { ...(downloadDir ? { downloadDir } : {}), ...(uploadDir ? { uploadDir } : {}) };
     const open = (Object.entries(permissions) as [ServiceName, ServicePermission][])
       .filter(([, p]) => p.access !== "none" && (p.folders ?? []).length === 0)
       .map(([s]) => s);
@@ -290,6 +348,7 @@ export function buildAgentTools(agent: BrokerAgent): AgentTools {
     identity: agent.credential.type === "oauth" ? agent.credential.identity : agent.name,
     permissions: agent.permissions,
     ...(agent.downloadDir ? { downloadDir: agent.downloadDir } : {}),
+    ...(agent.uploadDir ? { uploadDir: agent.uploadDir } : {}),
   };
   if (agent.credential.type === "service_account") {
     const auth = createServiceAccountClient(agent.credential.keyFile, scopesFor(agent.permissions));

@@ -1,7 +1,7 @@
 import http from "node:http";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createHash, generateKeyPairSync } from "crypto";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "fs";
 import type { AddressInfo } from "net";
 import type { Server as HttpServer } from "http";
 import { tmpdir } from "os";
@@ -1011,6 +1011,103 @@ describe("broker config", () => {
       expect(buildAgentTools(base).tools.map((t) => t.name)).not.toContain("drive_download_to_file");
       const withDl = buildAgentTools({ ...base, downloadDir: { hostDir: real(), callerDir: "/dl", maxBytes: 10, maxTotalBytes: 10, maxConcurrent: 1, minFreeBytes: 0 } });
       expect(withDl.tools.map((t) => t.name)).toContain("drive_download_to_file");
+    });
+  });
+
+  describe("upload_dir", () => {
+    const agent = (name: string, secret: string, lines: string) =>
+      sa("      drive: {access: write, folders: [F1]}\n", `${name}.json`, secret).replace(/^  a:/, `  ${name}:`) + lines;
+    // Outside the config folder: an upload folder may not sit beside the keys.
+    let outside: string;
+    beforeEach(() => {
+      outside = realpathSync(mkdtempSync(join(tmpdir(), "broker-up-")));
+    });
+    afterEach(() => rmSync(outside, { recursive: true, force: true }));
+    const folder = (name: string) => {
+      const d = join(outside, name);
+      mkdirSync(d, { recursive: true });
+      return d;
+    };
+    const keys = () => {
+      const made = readFileSync(key());
+      for (const n of ["a", "b"]) {
+        writeFileSync(join(dir, `${n}.json`), made);
+        chmodSync(join(dir, `${n}.json`), 0o600);
+      }
+    };
+
+    it("loads the host and caller folders, with a 2 GB default cap", () => {
+      keys();
+      const host = folder("up");
+      const c = parseBrokerConfig(yml(agent("a", hash("s"), `    upload_dir: {host: ${host}, caller: /opt/data/uploads/drive}\n`)), dir);
+      const stat = statSync(host, { bigint: true });
+      expect(c.agents[0].uploadDir).toEqual({
+        hostDir: host,
+        callerDir: "/opt/data/uploads/drive",
+        maxBytes: 2 * 1024 * 1024 * 1024,
+        dev: String(stat.dev),
+        ino: String(stat.ino),
+      });
+      expect(c.agents[0].downloadDir).toBeUndefined();
+    });
+
+    it("takes a custom cap, and refuses unknown keys, relative paths and missing folders", () => {
+      keys();
+      const host = folder("up");
+      const load = (v: string) => parseBrokerConfig(yml(agent("a", hash("s"), `    upload_dir: ${v}\n`)), dir);
+      expect(load(`{host: ${host}, caller: /up, max_bytes: 5}`).agents[0].uploadDir?.maxBytes).toBe(5);
+      expect(() => load(`{host: ${host}, caller: /up, max_total_bytes: 5}`)).toThrow(/upload_dir.*unknown/);
+      expect(() => load(`{host: up, caller: /up}`)).toThrow(/upload_dir/);
+      expect(() => load(`{host: ${host}, caller: /up/../etc}`)).toThrow(/upload_dir/);
+      expect(() => load(`{host: ${join(outside, "nope")}, caller: /up}`)).toThrow(/upload_dir/);
+      expect(() => load(`{host: ${host}, caller: /up, max_bytes: 0}`)).toThrow(/upload_dir/);
+    });
+
+    it("refuses a host path that goes through a link", () => {
+      keys();
+      const host = folder("up");
+      const link = join(outside, "up-link");
+      symlinkSync(host, link);
+      expect(() => parseBrokerConfig(yml(agent("a", hash("s"), `    upload_dir: {host: ${link}, caller: /up}\n`)), dir)).toThrow(/link/);
+    });
+
+    it("refuses folders shared between agents, or with any download folder", () => {
+      keys();
+      const up = folder("up");
+      const inner = folder("up/inner");
+      const two = (aLines: string, bLines: string) => yml(agent("a", hash("s"), aLines) + agent("b", hash("t"), bLines));
+      expect(() => parseBrokerConfig(two(`    upload_dir: {host: ${up}, caller: /up}\n`, `    upload_dir: {host: ${up}, caller: /up}\n`), dir)).toThrow(/upload_dir/);
+      expect(() => parseBrokerConfig(two(`    upload_dir: {host: ${up}, caller: /up}\n`, `    upload_dir: {host: ${inner}, caller: /up}\n`), dir)).toThrow(/upload_dir/);
+      expect(() => parseBrokerConfig(two(`    download_dir: {host: ${up}, caller: /dl}\n`, `    upload_dir: {host: ${inner}, caller: /up}\n`), dir)).toThrow(/upload_dir/);
+      expect(() => parseBrokerConfig(two(`    upload_dir: {host: ${inner}, caller: /up}\n`, `    download_dir: {host: ${up}, caller: /dl}\n`), dir)).toThrow(/download_dir/);
+      // The same folder under another spelling is still the same folder where case is ignored.
+      expect(() => parseBrokerConfig(two(`    upload_dir: {host: ${up}, caller: /up}\n`, `    upload_dir: {host: ${join(outside, "UP")}, caller: /up}\n`), dir)).toThrow(/upload_dir/);
+      // One agent's own two folders must be separate too.
+      expect(() => parseBrokerConfig(yml(agent("a", hash("s"), `    download_dir: {host: ${up}, caller: /dl}\n    upload_dir: {host: ${up}, caller: /up}\n`)), dir)).toThrow(/upload_dir/);
+    });
+
+    it("refuses the broker's own folder, or anything in or around it", () => {
+      keys();
+      const inside = join(realpathSync(dir), "up");
+      mkdirSync(inside);
+      const load = (host: string) => parseBrokerConfig(yml(agent("a", hash("s"), `    upload_dir: {host: ${host}, caller: /up}\n`)), dir);
+      expect(() => load(inside)).toThrow(/broker's own folder/);
+      expect(() => load(realpathSync(dir))).toThrow(/broker's own folder/);
+    });
+
+    it("offers drive_upload_from_file only with an upload folder and write access", () => {
+      keys();
+      const base = {
+        name: "a",
+        secretSha256: hash("s"),
+        credential: { type: "service_account" as const, keyFile: join(dir, "a.json") },
+        permissions: { drive: { access: "write" as const, folders: ["F1"] } },
+      };
+      const uploadDir = { hostDir: folder("up"), callerDir: "/up", maxBytes: 10, dev: "0", ino: "0" };
+      expect(buildAgentTools(base).tools.map((t) => t.name)).not.toContain("drive_upload_from_file");
+      expect(buildAgentTools({ ...base, uploadDir }).tools.map((t) => t.name)).toContain("drive_upload_from_file");
+      const readOnly = { ...base, permissions: { drive: { access: "read" as const, folders: ["F1"] } }, uploadDir };
+      expect(buildAgentTools(readOnly).tools.map((t) => t.name)).not.toContain("drive_upload_from_file");
     });
   });
 });

@@ -11,8 +11,14 @@ import {
   invalidateFolderTreeCache,
 } from "./folder-scope.js";
 import { DOWNLOAD_TIMEOUT_MS, DRIVE_FILE_ID, formatLimit, writeDownload } from "./drive-download.js";
+import { guessMimeType, openUpload } from "./drive-upload.js";
 
 const MAX_DOWNLOAD_BYTES = 32 * 1024 * 1024;
+
+/** Types whose content can never be sent as plain text. Sent that way, Drive stores the text. */
+const BINARY_MIME =
+  /^(video|audio|font)\/|^image\/(?!svg\+xml)|^application\/(pdf|zip|gzip|octet-stream|wasm|msword|epub\+zip|x-(tar|gzip|bzip2?|xz|7z-compressed|zip-compressed|rar-compressed)|vnd\.(rar|openxmlformats-|ms-|oasis\.opendocument\.))/i;
+const BASE64 = /^[A-Za-z0-9+/]*={0,2}$/;
 
 type AuthClient = InstanceType<typeof google.auth.OAuth2>;
 
@@ -31,6 +37,7 @@ export function getDriveTools(
   const allowedFolders = getAllowedFolders(config, "drive");
 
   const tools: ToolDef[] = [];
+  const uploadDir = config.uploadDir;
 
   // ── Read tools ──────────────────────────────────────────────────────────
 
@@ -338,7 +345,10 @@ export function getDriveTools(
   if (hasAccess(driveAccess, "write")) {
     tools.push({
       name: "drive_upload",
-      description: "Upload a file to Google Drive.",
+      description:
+        "Create a Drive file from content you pass in: text, or a small binary file as base64 with " +
+        'encoding "base64".' +
+        (uploadDir ? " For a video, PDF, image or anything large, use drive_upload_from_file instead." : ""),
       service: "drive",
       requiredAccess: "write",
       inputSchema: {
@@ -351,7 +361,12 @@ export function getDriveTools(
           },
           content: {
             type: "string",
-            description: "File content (text or base64).",
+            description: "File content: text, or base64 when encoding is base64.",
+          },
+          encoding: {
+            type: "string",
+            enum: ["text", "base64"],
+            description: 'How content is encoded (default: text). Binary files need "base64".',
           },
           mimeType: {
             type: "string",
@@ -366,8 +381,30 @@ export function getDriveTools(
       handler: async (args) => {
         const name = args.name as string;
         const content = args.content as string;
+        if (typeof content !== "string") throw new Error("content must be a string");
         const mimeType = (args.mimeType as string | undefined) ?? "text/plain";
         const folderId = args.folderId as string | undefined;
+        const encoding = (args.encoding as string | undefined) ?? "text";
+
+        let data: string | Buffer = content;
+        if (encoding === "base64") {
+          const compact = content.replace(/\s+/g, "");
+          if (!BASE64.test(compact) || compact.length % 4 === 1) {
+            throw new Error("content is not valid base64, so nothing was uploaded");
+          }
+          data = Buffer.from(compact, "base64");
+        } else if (encoding !== "text") {
+          throw new Error('encoding must be "text" or "base64"');
+        } else if (BINARY_MIME.test(mimeType)) {
+          // Stored as given, this would be a text file with a binary type: a broken file.
+          throw new Error(
+            `${mimeType} is a binary type, so its content can't be sent as text. ` +
+              (uploadDir
+                ? `Copy the file into ${uploadDir.callerDir} and use drive_upload_from_file`
+                : 'Pass the content as base64 with encoding "base64"') +
+              ". Nothing was uploaded.",
+          );
+        }
 
         if (
           folderId &&
@@ -385,7 +422,7 @@ export function getDriveTools(
           requestBody,
           media: {
             mimeType,
-            body: Readable.from([content]),
+            body: Readable.from([data]),
           },
           fields: "id, name, mimeType, parents",
           supportsAllDrives: true,
@@ -394,6 +431,87 @@ export function getDriveTools(
         return res.data;
       },
     });
+
+    // Offered only when the operator has set a folder the caller writes and this process reads.
+    if (uploadDir) {
+      tools.push({
+        name: "drive_upload_from_file",
+        description:
+          `Upload a file from ${uploadDir.callerDir} to Google Drive, byte for byte: a video, PDF, image, ` +
+          "audio or any other file. Copy the file into that folder first, then pass its full path. " +
+          `Up to ${formatLimit(uploadDir.maxBytes)}. The content never passes through the conversation.`,
+        service: "drive",
+        requiredAccess: "write",
+        inputSchema: {
+          type: "object",
+          required: ["path"],
+          properties: {
+            path: {
+              type: "string",
+              description: `Full path of a file directly inside ${uploadDir.callerDir}.`,
+            },
+            name: {
+              type: "string",
+              description: "Name for the file in Drive (default: the file's own name).",
+            },
+            mimeType: {
+              type: "string",
+              description: "MIME type (default: chosen from the file name).",
+            },
+            folderId: {
+              type: "string",
+              description: "Parent folder ID to upload into.",
+            },
+          },
+        },
+        handler: async (args) => {
+          const folderId = args.folderId as string | undefined;
+          if (
+            folderId &&
+            allowedFolders.length > 0 &&
+            !(await isWithinAllowedFolders(drive, folderId, allowedFolders))
+          ) {
+            throw new Error(`Folder ${folderId} is not in allowed folders`);
+          }
+
+          const file = await openUpload(uploadDir, args.path);
+          const name = typeof args.name === "string" && args.name.trim() ? args.name : file.name;
+          const mimeType = typeof args.mimeType === "string" && args.mimeType ? args.mimeType : guessMimeType(name);
+          const requestBody: Record<string, unknown> = { name };
+          const targetFolder = folderId || (allowedFolders.length > 0 ? allowedFolders[0] : null);
+          if (targetFolder) requestBody.parents = [targetFolder];
+
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT_MS);
+          try {
+            const res = await drive.files.create(
+              {
+                requestBody,
+                media: { mimeType, body: file.stream },
+                fields: "id, name, mimeType, parents, size, webViewLink",
+                supportsAllDrives: true,
+              },
+              // Replaces the general Google timeout, which would cut off a long upload.
+              { signal: controller.signal, timeout: DOWNLOAD_TIMEOUT_MS },
+            );
+            const stored = Number(res.data.size);
+            if (res.data.size != null && stored !== file.size) {
+              throw new Error(
+                `Drive stored ${stored} bytes but the file is ${file.size} bytes, so the upload is not a true copy ` +
+                  `(Drive file ${res.data.id}). Check it before sharing.`,
+              );
+            }
+            return { ...res.data, size: file.size };
+          } catch (err) {
+            if (controller.signal.aborted) throw new Error("The upload took too long and was stopped.");
+            throw err;
+          } finally {
+            clearTimeout(timer);
+            file.close();
+          }
+        },
+      });
+    }
 
     tools.push({
       name: "drive_create_folder",
