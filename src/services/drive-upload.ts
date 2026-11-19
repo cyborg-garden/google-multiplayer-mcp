@@ -5,7 +5,9 @@
  * this process reads it on the agent's behalf. The agent can write to that
  * folder and often to its parents, so it can swap the folder for a link to
  * someone else's at any instant. No sequence of checks made by path survives
- * that: each check can be answered by a different folder.
+ * that: each check can be answered by a different folder. (This is also why
+ * the folder should sit where the agent can't rename it or its parents: the
+ * identity below is itself read by path, once, when the config is loaded.)
  *
  * So the file is never opened by its full path. A short-lived reader process
  * is started inside the folder. Its working directory is a hold on one
@@ -18,7 +20,7 @@
 import { spawn } from "child_process";
 import { statSync } from "fs";
 import { posix } from "path";
-import { PassThrough, type Readable } from "stream";
+import { Transform, type Readable } from "stream";
 import type { UploadDir } from "../types.js";
 import { formatLimit } from "./drive-download.js";
 
@@ -134,7 +136,19 @@ export async function openUpload(dir: UploadDir, callerPath: unknown): Promise<O
   // Node throws away whatever a finished child left unread on its stdout, and a
   // small file is written and the reader gone before anyone asks for it. Piping
   // from the start keeps every byte; the pipe's own limit holds a large file back.
-  const out = new PassThrough();
+  // It also counts: a file cut short while it is read must fail the upload,
+  // not arrive in Drive as a shorter file that looks whole.
+  let expected = -1;
+  let seen = 0;
+  const out = new Transform({
+    transform(chunk: Buffer, _encoding, done) {
+      seen += chunk.length;
+      done(null, chunk);
+    },
+    flush(done) {
+      done(expected >= 0 && seen !== expected ? new Error("The file changed while it was being uploaded, so the upload was stopped.") : null);
+    },
+  });
   child.stdout?.pipe(out);
 
   const closed = new Promise<void>((done) => {
@@ -178,6 +192,7 @@ export async function openUpload(dir: UploadDir, callerPath: unknown): Promise<O
     });
 
     if (typeof answer.size === "number" && Number.isSafeInteger(answer.size) && answer.size >= 0 && answer.size <= dir.maxBytes) {
+      expected = answer.size;
       return { name, size: answer.size, stream: out as Readable, close, closed };
     }
     switch (answer.refused) {

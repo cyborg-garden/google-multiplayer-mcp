@@ -17,7 +17,7 @@ const MAX_DOWNLOAD_BYTES = 32 * 1024 * 1024;
 
 /** Types whose content can never be sent as plain text. Sent that way, Drive stores the text. */
 const BINARY_MIME =
-  /^(video|audio|font)\/|^image\/(?!svg\+xml)|^application\/(pdf|zip|gzip|octet-stream|wasm|msword|epub\+zip|x-(tar|gzip|bzip2?|xz|7z-compressed|zip-compressed|rar-compressed)|vnd\.(rar|openxmlformats-|ms-|oasis\.opendocument\.))/i;
+  /^(video|audio|font|model)\/|^image\/(?!svg\+xml)|^application\/(pdf|zip|gzip|zstd|octet-stream|wasm|msword|ogg|mp4|java-archive|epub\+zip|x-(tar|gzip|bzip2?|xz|zip|rar|7z-compressed|zip-compressed|rar-compressed)|vnd\.(rar|openxmlformats-|ms-|oasis\.opendocument\.))/i;
 const BASE64 = /^[A-Za-z0-9+/]*={0,2}$/;
 
 type AuthClient = InstanceType<typeof google.auth.OAuth2>;
@@ -382,7 +382,7 @@ export function getDriveTools(
         const name = args.name as string;
         const content = args.content as string;
         if (typeof content !== "string") throw new Error("content must be a string");
-        const mimeType = (args.mimeType as string | undefined) ?? "text/plain";
+        const mimeType = (typeof args.mimeType === "string" && args.mimeType.trim()) || "text/plain";
         const folderId = args.folderId as string | undefined;
         const encoding = (args.encoding as string | undefined) ?? "text";
 

@@ -183,7 +183,18 @@ function parseUploadDir(agent: string, raw: unknown): UploadDir | undefined {
   if (!statSync(real).isDirectory()) bad("host is not a folder");
   const maxBytes = d.max_bytes ?? DEFAULT_DOWNLOAD_MAX_BYTES;
   if (!Number.isSafeInteger(maxBytes) || (maxBytes as number) < 1) bad("max_bytes must be a whole number, at least 1");
-  return { hostDir: real, callerDir: posix.normalize(caller as string), maxBytes: maxBytes as number, ...folderIdentity(real) };
+  // The identity is what every upload is checked against, so take it and then
+  // confirm the path still names a real folder with that same identity.
+  const identity = folderIdentity(real);
+  let after: { dev: string; ino: string };
+  try {
+    if (realpathSync(hostPath) !== real) throw new Error("moved");
+    after = folderIdentity(real);
+  } catch {
+    return bad("host folder changed while the config was being read");
+  }
+  if (after.dev !== identity.dev || after.ino !== identity.ino) bad("host folder changed while the config was being read");
+  return { hostDir: real, callerDir: posix.normalize(caller as string), maxBytes: maxBytes as number, ...identity };
 }
 
 /** Parse and validate broker YAML. Anything risky stops startup. */

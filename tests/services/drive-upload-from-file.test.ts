@@ -5,7 +5,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type { Readable } from "stream";
 import { execFileSync } from "child_process";
-import { linkSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "fs";
+import { linkSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, truncateSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import type { PermissionConfig, UploadDir } from "../../src/types.js";
@@ -230,6 +230,12 @@ describe("drive_upload_from_file reads only the agent's own folder", () => {
     await opened.closed;
   });
 
+  it("refuses a folder on another device with the same inode number", async () => {
+    put("cut.mp4");
+    const cfg = config("write", { dev: "999999" });
+    await refused(`${CALLER}/cut.mp4`, cfg, /replaced by a link/);
+  });
+
   it("refuses a missing folder", async () => {
     const cfg = config();
     rmSync(hostDir, { recursive: true });
@@ -282,6 +288,31 @@ describe("drive_upload_from_file cleans up after itself", () => {
     expect(sent.calls).toHaveLength(1);
   });
 
+  it("gives the slot back after a refusal", async () => {
+    put("cut.mp4");
+    symlinkSync(join(hostDir, "cut.mp4"), join(hostDir, "link.mp4"));
+    for (let i = 0; i < UPLOAD_MAX_CONCURRENT + 2; i++) {
+      await expect(fromFile().handler({ path: `${CALLER}/nope.mp4` })).rejects.toThrow(/No file named/);
+      await expect(fromFile().handler({ path: `${CALLER}/link.mp4` })).rejects.toThrow(/Links/);
+    }
+    await fromFile().handler({ path: `${CALLER}/cut.mp4` });
+    expect(sent.calls).toHaveLength(1);
+  });
+
+  it("fails the upload when the file is cut short while it is read", async () => {
+    const big = Buffer.alloc(9 * 1024 * 1024, 7);
+    put("long.mov", big);
+    const opened = await openUpload(config("write", { maxBytes: 64 * 1024 * 1024 }).uploadDir!, `${CALLER}/long.mov`);
+    truncateSync(join(hostDir, "long.mov"), 1024 * 1024);
+    let n = 0;
+    const read = (async () => {
+      for await (const c of opened.stream) n += (c as Buffer).length;
+    })();
+    await expect(read).rejects.toThrow(/changed while it was being uploaded/);
+    expect(n).toBeLessThan(big.length);
+    opened.close();
+  });
+
   it("runs only a few uploads at once from one folder", async () => {
     put("cut.mp4");
     const cfg = config();
@@ -316,7 +347,7 @@ describe("drive_upload never stores base64 as text", () => {
     for (const mimeType of [
       "video/mp4", "Video/MP4", "application/pdf", "image/png", "audio/wav", "application/zip", "application/octet-stream",
       "application/x-7z-compressed", "application/vnd.rar", "application/epub+zip", "application/wasm",
-      "application/vnd.oasis.opendocument.text",
+      "application/vnd.oasis.opendocument.text", " video/mp4", "application/ogg", "application/java-archive", "model/gltf-binary",
     ]) {
       await expect(upload().handler({ name: "x", content: BINARY.toString("base64"), mimeType })).rejects.toThrow(/drive_upload_from_file/);
     }

@@ -200,14 +200,26 @@ The agent copies the file into its upload folder first. That folder comes only f
 
 ```yaml
     upload_dir:
-      host: /srv/agents/research/uploads/drive   # the folder as the broker sees it
-      caller: /data/uploads/drive                # the same folder as the agent sees it
-      max_bytes: 2147483648                      # optional: largest file; 2 GB by default
+      host: /srv/broker-uploads/research   # the folder as the broker sees it
+      caller: /data/uploads/drive          # the same folder as the agent sees it
+      max_bytes: 2147483648                # optional: largest file; 2 GB by default
 ```
 
-- The agent must be able to write to this folder, so it is a different folder from `download_dir`, which is best mounted read-only. A folder inside the agent's own data folder is the usual choice.
+**Setup for an agent in a container:** give each agent a host folder outside its own data folder, with parents only the operator can change, and bind-mount it read-write into the container at the `caller` path:
+
+```yaml
+# the agent's compose service
+volumes:
+  - /srv/broker-uploads/research:/data/uploads/drive
+```
+
+The agent can then fill the folder but can't rename it, delete it, or replace it or any folder above it. Don't point `host` at a folder inside the agent's own data folder: the broker learns which directory the folder is by reading its path once at startup, and an agent that can swap that path at that moment could have another folder recorded in its place.
+
+- The agent must be able to write to this folder, so it is a different folder from `download_dir`, which is best mounted read-only.
 - The host folder must exist, be given as its real path (no links), and belong to one agent only. It may not be the same as, inside, or around any `download_dir`, another agent's `upload_dir`, or the broker's own folder (where its keys are kept).
 - Only regular files directly in the folder are sent. Links, pipes, subfolders, hidden files and paths elsewhere are refused.
 - The broker records which directory the folder is when it starts, and reads every upload from that exact directory, opening the file by name from inside it. An agent that swaps its folder for a link to someone else's gets a refusal, however it times the swap. If you delete and recreate the folder, restart the broker.
+- If the file is cut short or changes size while it is read, the upload fails; nothing shorter than the file is left in Drive looking whole.
 - Two uploads at a time per agent.
+- Keep credentials out of it: anything in this folder can be sent to Drive on the agent's word. The broker refuses its own config folder, but can't know where else you keep keys.
 - Same folder allowlist as `drive_upload`.
