@@ -119,7 +119,7 @@ Agents only see the tools their level allows.
 | Sheets | `sheets_get`, `sheets_create`, `sheets_update`, `sheets_batch_update`, `sheets_delete` |
 | Calendar | `calendar_list_events`, `calendar_get_event`, `calendar_list_calendars`, `calendar_create_event`, `calendar_update_event`, `calendar_delete_event` |
 | Gmail | `gmail_list`, `gmail_get`, `gmail_search`, `gmail_send`, `gmail_draft`, `gmail_delete` (permanent) |
-| Login | `google_auth_url`, `google_auth_exchange`, `google_auth_start`, `google_auth_status` |
+| Login | `google_auth_url`, `google_auth_exchange`, `google_auth_start` (stdio only), `google_auth_status` |
 
 `drive_download_to_file` and `drive_upload_from_file` are broker-only. See [Broker mode](#broker-mode).
 
