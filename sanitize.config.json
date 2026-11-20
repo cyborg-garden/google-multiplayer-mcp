@@ -1,0 +1,35 @@
+{
+  "$comment": "Sanitization gate config for google-multiplayer-mcp. The gate itself lives in cyborg-garden/swarm-map (docs/sanitization-gate.md); this file only says what a particular means here.",
+  "package_name": "google-multiplayer-mcp",
+  "package_kind": "public MCP server for Google Workspace, used by many agents and operators",
+  "sensitive_prefixes": [
+    "skills/",
+    "examples/"
+  ],
+  "$comment_prefixes": "skills/ ships to agents and examples/ is copied by operators. Top-level *.md are always included.",
+  "semantic": {
+    "domain_noun": "deployment, operator or Google account",
+    "flag_examples": [
+      "a real Google account, Drive folder ID, document ID, calendar ID or OAuth client tied to one operator",
+      "names of real people or organisations taken from one deployment's mail, files or calendar",
+      "contact details of a private individual: personal email, phone number, home address, messaging handle or account ID",
+      "credentials, tokens, internal hostnames, server addresses or chat/group IDs of a real deployment"
+    ],
+    "do_not_flag_examples": [
+      "the publishing organisation and its public projects: Cyborg Garden / cyborg-garden / cyborg.garden, the former names NimbleCo / NimbleCoAI / NimbleCoOrg / nimbleco.ai, this repo's own name and GitHub URLs",
+      "Google API names, scopes and public documentation",
+      "the example profiles' generic role descriptions",
+      "generic tool, API, library, model, provider and standard names, and public reference material",
+      "clearly fictional placeholders (Subject A, <case>, example.com, <host>)"
+    ],
+    "model": "moonshotai/kimi-k3"
+  },
+  "deterministic": {
+    "enabled": true,
+    "allow_substrings": [],
+    "skip_paths": [
+      "tests/"
+    ],
+    "$comment_skip_paths": "Test code that holds credential-shaped fixtures on purpose. Provider tokens and private keys are still reported inside these paths."
+  }
+}
