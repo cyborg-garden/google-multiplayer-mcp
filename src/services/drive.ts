@@ -1,6 +1,7 @@
 /** Drive service — tools for Google Drive access with folder filtering. */
 
 import { Readable } from "stream";
+import { createHash } from "crypto";
 import { google } from "googleapis";
 import type { PermissionConfig, ToolDef } from "../types.js";
 import { hasAccess } from "../types.js";
@@ -15,9 +16,22 @@ import { guessMimeType, openUpload } from "./drive-upload.js";
 
 const MAX_DOWNLOAD_BYTES = 32 * 1024 * 1024;
 
-/** Types whose content can never be sent as plain text. Sent that way, Drive stores the text. */
+/** Types whose content can never be sent as plain text by the legacy upload tool. */
 const BINARY_MIME =
   /^(video|audio|font|model)\/|^image\/(?!svg\+xml)|^application\/(pdf|zip|gzip|zstd|octet-stream|wasm|msword|ogg|mp4|java-archive|epub\+zip|x-(tar|gzip|bzip2?|xz|zip|rar|7z-compressed|zip-compressed|rar-compressed)|vnd\.(rar|openxmlformats-|ms-|oasis\.opendocument\.))/i;
+
+/** Text updates are deliberately limited to types whose bytes are UTF-8 text. */
+const TEXT_MIME = new Set([
+  "text/plain", "text/markdown", "text/html", "text/css", "text/csv", "text/xml",
+  "application/json", "application/ld+json", "application/xml", "application/xhtml+xml",
+  "application/javascript", "application/x-javascript", "application/x-sh",
+  "application/x-python", "application/toml", "application/sql", "image/svg+xml",
+]);
+const TEXT_MIME_SUFFIX = /\+(?:json|xml)$/i;
+function isTextMime(mimeType: string): boolean {
+  const normalized = mimeType.trim().split(";", 1)[0].trim().toLowerCase();
+  return normalized.startsWith("text/") || TEXT_MIME.has(normalized) || TEXT_MIME_SUFFIX.test(normalized);
+}
 const BASE64 = /^[A-Za-z0-9+/]*={0,2}$/;
 
 type AuthClient = InstanceType<typeof google.auth.OAuth2>;
@@ -717,7 +731,7 @@ export function getDriveTools(
 
     tools.push({
       name: "drive_update",
-      description: "Update the content of an existing file in Google Drive.",
+      description: "Update an existing file's text content. Binary updates need drive_update_from_file, which preserves the Drive file ID.",
       service: "drive",
       requiredAccess: "write",
       inputSchema: {
@@ -730,18 +744,17 @@ export function getDriveTools(
           },
           content: {
             type: "string",
-            description: "New file content.",
+            description: "New UTF-8 text content.",
           },
           mimeType: {
             type: "string",
-            description: "MIME type of the content (default: text/plain).",
+            description: "MIME type (default: the file's current type).",
           },
         },
       },
       handler: async (args) => {
         const fileId = args.fileId as string;
         const content = args.content as string;
-        const mimeType = (args.mimeType as string | undefined) ?? "text/plain";
 
         // Check folder access first
         const meta = await drive.files.get({
@@ -752,6 +765,19 @@ export function getDriveTools(
 
         if (!(await isWithinAllowedFolders(drive, fileId, allowedFolders))) {
           throw new Error("Item is outside allowed folders");
+        }
+
+        if (typeof content !== "string") throw new Error("content must be a string");
+        const requestedMime = typeof args.mimeType === "string" ? args.mimeType.trim() : "";
+        const mimeType = requestedMime || meta.data.mimeType || "text/plain";
+        if (!isTextMime(mimeType)) {
+          throw new Error(
+            `${mimeType} isn't a supported UTF-8 text type. ` +
+              (uploadDir
+                ? `For a binary file, copy it into ${uploadDir.callerDir} and use drive_update_from_file`
+                : "A byte-safe file update is not configured for this agent") +
+              ". Nothing was updated.",
+          );
         }
 
         const res = await drive.files.update({
@@ -767,6 +793,92 @@ export function getDriveTools(
         return res.data;
       },
     });
+
+    // Unlike a new upload, this keeps the existing Drive object, name and parents.
+    if (uploadDir) {
+      tools.push({
+        name: "drive_update_from_file",
+        description:
+          `Replace an existing Drive file with the bytes of a file inside ${uploadDir.callerDir}. ` +
+          `Preserves its file ID, name and parent folders. Up to ${formatLimit(uploadDir.maxBytes)}.`,
+        service: "drive",
+        requiredAccess: "write",
+        inputSchema: {
+          type: "object",
+          required: ["fileId", "path"],
+          properties: {
+            fileId: {
+              type: "string",
+              description: "ID of the existing Drive file to replace.",
+            },
+            path: {
+              type: "string",
+              description: `Full path of a file directly inside ${uploadDir.callerDir}.`,
+            },
+            mimeType: {
+              type: "string",
+              description: "MIME type (default: the existing Drive file's type).",
+            },
+          },
+        },
+        handler: async (args) => {
+          const fileId = args.fileId;
+          if (typeof fileId !== "string" || !DRIVE_FILE_ID.test(fileId)) {
+            throw new Error("fileId must be a Drive file id");
+          }
+          const meta = await drive.files.get({
+            fileId,
+            fields: "id, name, mimeType, parents",
+            supportsAllDrives: true,
+          });
+          if (!(await isWithinAllowedFolders(drive, fileId, allowedFolders))) {
+            throw new Error("Item is outside allowed folders");
+          }
+
+          const file = await openUpload(uploadDir, args.path);
+          const mimeType = (typeof args.mimeType === "string" && args.mimeType.trim())
+            ? args.mimeType.trim()
+            : meta.data.mimeType || guessMimeType(file.name);
+          const digest = createHash("md5");
+          file.stream.on("data", (chunk: Buffer) => digest.update(chunk));
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT_MS);
+          try {
+            const res = await drive.files.update(
+              {
+                fileId,
+                media: { mimeType, body: file.stream },
+                fields: "id, name, mimeType, parents, modifiedTime, size, md5Checksum",
+                supportsAllDrives: true,
+              },
+              { signal: controller.signal, timeout: DOWNLOAD_TIMEOUT_MS },
+            );
+            const stored = Number(res.data.size);
+            if (res.data.size == null || stored !== file.size) {
+              throw new Error(
+                `Drive reported ${res.data.size == null ? "no stored size" : `${stored} bytes`} for a ${file.size}-byte file, ` +
+                  `so the update isn't verified (Drive file ${res.data.id}). Download it before sharing.`,
+              );
+            }
+            const expectedMd5 = digest.digest("base64");
+            if (typeof res.data.md5Checksum !== "string" || res.data.md5Checksum !== expectedMd5) {
+              throw new Error(
+                `Drive's MD5 checksum doesn't match the source, so the update isn't verified ` +
+                  `(Drive file ${res.data.id}). Download it before sharing.`,
+              );
+            }
+            return { ...res.data, size: stored };
+          } catch (err) {
+            if (controller.signal.aborted) throw new Error("The update took too long and was stopped.");
+            throw err;
+          } finally {
+            clearTimeout(timer);
+            file.close();
+          }
+        },
+      });
+    }
+
   }
 
   // ── Admin tools ──────────────────────────────────────────────────────────
